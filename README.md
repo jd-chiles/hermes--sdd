@@ -54,6 +54,9 @@ Sprint 2 release checks build and inspect the real artifact:
 
 ```bash
 python3 scripts/host_smoke.py
+python3 scripts/clean_install_smoke.py \
+  --repo jd-chiles/hermes-sdd-team \
+  --ref 400309b27a07d47a7a723ab8a205c343b4e920fe
 ```
 
 The smoke test extracts a tarball into a temporary directory and runs Hermes Plugin Doctor and validation there, so success does not depend on importing the source checkout.

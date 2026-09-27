@@ -5,6 +5,7 @@ from pathlib import Path
 from sdd_hermes.core import SDDError
 from sdd_hermes.planning import build_plan
 from sdd_hermes import SDDService
+from sdd_hermes.bridge import HermesBridge
 
 
 class SDDTests(unittest.TestCase):
@@ -58,6 +59,33 @@ class SDDTests(unittest.TestCase):
             service.submit(task_id, 1, [], [], "first", attempt_id="attempt-1")
             with self.assertRaises(Exception):
                 service.submit(task_id, 1, [], [], "duplicate", attempt_id="attempt-1")
+
+    def test_recovery_reuses_native_task_keys_instead_of_creating_duplicates(self):
+        class RecoveringBridge(HermesBridge):
+            def __init__(self):
+                super().__init__()
+                self.created = 0
+
+            def ensure_board(self, board_slug, display_name):
+                return {"available": True, "board_slug": board_slug}
+
+            def provision_profiles(self, profiles):
+                return []
+
+            def find_task(self, board_slug, stable_key):
+                return f"native-{stable_key}"
+
+            def create_task(self, board_slug, title, body, assignee, parents=None):
+                self.created += 1
+                return {"available": True, "result": {"task_id": "unexpected"}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = RecoveringBridge()
+            service = SDDService(Path(directory), bridge=bridge)
+            result = service.initialize("Fix a parser regression", "bugfix")
+            service.sync_board(build_plan("Fix a parser regression", "bugfix"), "sdd-fix-a-parser-regression")
+            self.assertEqual(bridge.created, 0)
+            self.assertTrue(all(task["native_task_id"].startswith("native-") for task in service.ledger.tasks()))
 
 
 if __name__ == "__main__":

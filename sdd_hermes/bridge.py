@@ -65,6 +65,30 @@ class HermesBridge:
         raw = self.terminal(command)
         return {"available": True, "result": raw}
 
+    def find_task(self, board_slug: str, stable_key: str) -> str | None:
+        """Find an already-created task during recovery using its stable body key."""
+        if not self.dispatch:
+            return None
+        raw = self.terminal(f"hermes kanban --board {shlex.quote(board_slug)} list --json")
+        if isinstance(raw, dict) and isinstance(raw.get("result"), (str, dict, list)):
+            raw = raw["result"]
+        candidates: list[Any] = []
+        if isinstance(raw, dict):
+            candidates = raw.get("tasks", raw.get("items", [])) if isinstance(raw.get("tasks", raw.get("items", [])), list) else []
+        elif isinstance(raw, str):
+            try:
+                decoded = json.loads(raw)
+                candidates = decoded if isinstance(decoded, list) else decoded.get("tasks", decoded.get("items", []))
+            except (json.JSONDecodeError, AttributeError):
+                return None
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            body = str(candidate.get("body", ""))
+            if stable_key in body or candidate.get("stable_key") == stable_key:
+                return candidate.get("task_id") or candidate.get("id")
+        return None
+
     def transition_task(self, board_slug: str, native_task_id: str, action: str, reason: str = "") -> Any:
         if action not in {"block", "unblock"}:
             raise ValueError(f"unsupported Kanban transition: {action}")
