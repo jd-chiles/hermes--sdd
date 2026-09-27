@@ -1,6 +1,6 @@
 # Sprint 2 — release hardening and host integration
 
-Status: in progress
+Status: implementation complete; final WSL2 CI result pending external confirmation
 
 ## Objective
 
@@ -28,4 +28,12 @@ Prove that the public artifact loads through Hermes, preserve the host/plugin bo
 
 ## Exit evidence
 
-The release candidate must include the artifact SHA-256, Plugin Doctor output, validation output, unit-test output, and a short list of any host limitations. A green source-tree test is not sufficient.
+Evidence collected:
+
+- Local unit suite: 5 tests passed after deterministic SQLite connection cleanup was added for Windows file-lock behavior.
+- Repository CI matrix: Linux, macOS, and Windows repository checks passed in run 36349473446.
+- Linux and macOS Hermes host contracts passed in the preceding observable CI runs; the final run reached the native WSL2 checkout and host-check step.
+- The final WSL2 host-contract result is not yet observable because the GitHub API rate limit was reached while polling run 36349473446.
+- The exact immutable artifact install command, artifact hash, Plugin Doctor result, validation result, and known host limitations are recorded in docs/release-checklist.md.
+
+The implementation is complete; Sprint 2 should be marked fully closed after the final WSL2 job is confirmed green.
