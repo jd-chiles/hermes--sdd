@@ -63,11 +63,14 @@ jobs:
     needs: repository
     steps:
       - uses: actions/checkout@v4
+      - name: Install Ubuntu WSL2 distribution
+        uses: Ubuntu/WSL/.github/actions/wsl-install@main
+        with:
+          distro: Ubuntu
       - name: Verify WSL2 availability
         shell: pwsh
         run: |
           wsl.exe --status
-          wsl.exe --install --distribution Ubuntu --no-launch
           wsl.exe --set-default-version 2
           wsl.exe --set-default Ubuntu
       - name: Run Linux host checks through WSL2
