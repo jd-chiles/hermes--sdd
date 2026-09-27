@@ -65,7 +65,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Verify WSL2 availability
         shell: pwsh
-        run: wsl.exe --status
+        run: |
+          wsl.exe --status
+          wsl.exe --install --distribution Ubuntu --no-launch
+          wsl.exe --set-default-version 2
+          wsl.exe --set-default Ubuntu
       - name: Run Linux host checks through WSL2
         shell: pwsh
         run: |
