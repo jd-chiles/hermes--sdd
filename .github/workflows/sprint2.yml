@@ -62,7 +62,6 @@ jobs:
     runs-on: windows-latest
     needs: repository
     steps:
-      - uses: actions/checkout@v4
       - name: Install Ubuntu WSL2 distribution
         uses: Ubuntu/WSL/.github/actions/wsl-install@main
         with:
@@ -73,12 +72,17 @@ jobs:
           wsl.exe --status
           wsl.exe --set-default-version 2
           wsl.exe --set-default Ubuntu
+      - name: Check out repository inside WSL2
+        uses: Ubuntu/WSL/.github/actions/wsl-checkout@main
+        with:
+          distro: Ubuntu
+          working-dir: /tmp/hermes-sdd-team
       - name: Run Linux host checks through WSL2
-        shell: pwsh
-        run: |
-          $windowsPath = (Get-Location).Path
-          $drive = $windowsPath.Substring(0, 1).ToLowerInvariant()
-          $relativePath = $windowsPath.Substring(2).Replace('\', '/')
-          $wslPath = "/mnt/$drive$relativePath"
-          wsl.exe --distribution Ubuntu --user root -- echo "Ubuntu WSL2 ready"
-          wsl.exe --distribution Ubuntu --user root -- bash -lc "cd '$wslPath' && curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash && hermes plugins doctor . --ci && hermes plugins validate ."
+        uses: Ubuntu/WSL/.github/actions/wsl-bash@main
+        with:
+          distro: Ubuntu
+          working-dir: /tmp/hermes-sdd-team
+          exec: |
+            curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+            hermes plugins doctor . --ci
+            hermes plugins validate .
