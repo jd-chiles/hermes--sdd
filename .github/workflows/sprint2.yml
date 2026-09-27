@@ -77,5 +77,5 @@ jobs:
           $drive = $windowsPath.Substring(0, 1).ToLowerInvariant()
           $relativePath = $windowsPath.Substring(2).Replace('\', '/')
           $wslPath = "/mnt/$drive$relativePath"
-          wsl.exe --distribution Ubuntu -- echo "Ubuntu WSL2 ready"
-          wsl.exe --distribution Ubuntu -- bash -lc "cd '$wslPath' && curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash && hermes plugins doctor . --ci && hermes plugins validate ."
+          wsl.exe --distribution Ubuntu --user root -- echo "Ubuntu WSL2 ready"
+          wsl.exe --distribution Ubuntu --user root -- bash -lc "cd '$wslPath' && curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash && hermes plugins doctor . --ci && hermes plugins validate ."
