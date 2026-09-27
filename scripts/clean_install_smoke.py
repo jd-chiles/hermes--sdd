@@ -34,7 +34,9 @@ def main() -> int:
         install = run([hermes, "plugins", "install", args.repo, "--ref", args.ref, "--enable"], env)
         listing = run([hermes, "plugins", "list", "--plain", "--no-bundled"], env)
         plugin_doctor = run([hermes, "plugins", "doctor", "hermes-sdd-team", "--ci"], env)
-        result = {"ok": all(item["exit_status"] == 0 for item in (install, listing, plugin_doctor)), "repo": args.repo, "ref": args.ref, "checks": [install, listing, plugin_doctor]}
+        listing_output = str(listing["stdout"])
+        enabled = any(line.startswith("enabled ") and "hermes-sdd-team" in line for line in listing_output.splitlines())
+        result = {"ok": all(item["exit_status"] == 0 for item in (install, listing, plugin_doctor)) and enabled, "enabled": enabled, "repo": args.repo, "ref": args.ref, "checks": [install, listing, plugin_doctor]}
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result["ok"] else 1
 

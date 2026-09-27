@@ -3,7 +3,6 @@ name = "hermes-sdd-team"
 version = "0.1.0"
 description = "Verified local delivery workflow for Hermes Agent"
 requires-python = ">=3.10"
-dependencies = []
 
 [project.entry-points."hermes_agent.plugins"]
 hermes-sdd-team = "sdd_hermes:register"
