@@ -1,0 +1,73 @@
+name: Hermes SDD Sprint 2
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  repository:
+    name: Repository checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile and unit test
+        run: |
+          python -m compileall -q sdd_hermes scripts
+          python -m unittest discover -s tests -v
+      - name: Build release artifact
+        run: python scripts/package_release.py --output artifact/hermes-sdd-team.tar.gz
+      - name: Check artifact manifest
+        shell: bash
+        run: test -s artifact/hermes-sdd-team.tar.gz && test -s artifact/hermes-sdd-team.tar.gz.json
+
+  hermes-linux:
+    name: Hermes host contract (Linux)
+    runs-on: ubuntu-latest
+    needs: repository
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Hermes
+        shell: bash
+        run: curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+      - name: Plugin Doctor
+        run: hermes plugins doctor . --ci
+      - name: Plugin validation
+        run: hermes plugins validate .
+
+  hermes-macos:
+    name: Hermes host contract (macOS)
+    runs-on: macos-latest
+    needs: repository
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Hermes
+        shell: bash
+        run: curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+      - name: Plugin Doctor
+        run: hermes plugins doctor . --ci
+      - name: Plugin validation
+        run: hermes plugins validate .
+
+  hermes-wsl2:
+    name: Hermes host contract (Windows WSL2)
+    runs-on: windows-latest
+    needs: repository
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify WSL2 availability
+        shell: pwsh
+        run: wsl.exe --status
+      - name: Run Linux host checks through WSL2
+        shell: pwsh
+        run: |
+          $path = $PWD.Path.Replace('\', '/')
+          wsl.exe bash -lc "cd /mnt$path && curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash && hermes plugins doctor . --ci && hermes plugins validate ."

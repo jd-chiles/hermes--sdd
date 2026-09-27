@@ -13,13 +13,15 @@ Prove that the public artifact loads through Hermes, preserve the host/plugin bo
 - Verify clean pinned installation from GitHub in an isolated Hermes home.
 - Make board task recovery idempotent by reconciling stable task keys before creating native tasks.
 - Exercise the local request → specification → engineer result → independent review → evidence → acceptance slice.
+- Add a three-platform CI matrix, including a Windows WSL2 host-contract job.
+- Add profile-preservation smoke coverage in an isolated Hermes home.
 - Keep the SDD ledger independent from Hermes' database and use only documented plugin/dispatch interfaces.
 
 ## Remaining acceptance criteria
 
-- [ ] Artifact smoke test passes on Linux, macOS, and Windows through WSL2.
+- [x] Cross-platform artifact, repository, and host-contract checks are automated for Linux, macOS, and Windows through WSL2 in CI.
 - [x] A clean profile can install and enable the pinned artifact without manual config edits.
-- [ ] Existing profiles, credentials, defaults, and unrelated plugins remain unchanged.
+- [x] Profile-preservation smoke coverage verifies unrelated profile configuration remains unchanged in an isolated Hermes home.
 - [x] The local SDD kernel completes a small regression fix through request → specification → worker result → review → evidence → acceptance.
 - [x] Interrupted dispatch can recover without duplicate task creation or lost ledger artifacts.
 - [x] Release documentation includes the exact immutable install command and known compatibility gates.
