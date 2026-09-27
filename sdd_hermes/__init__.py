@@ -68,6 +68,12 @@ class SDDService:
                 native[task["stable_key"]] = task_row["native_task_id"]
                 continue
             parents = [native[task["parent_key"]]] if task.get("parent_key") in native else []
+            recovered_native_id = self.bridge.find_task(board_slug, task["stable_key"])
+            if recovered_native_id:
+                self.ledger.set_native_task_id(task_row["task_id"], recovered_native_id)
+                native[task["stable_key"]] = recovered_native_id
+                created.append({"stable_key": task["stable_key"], "native_task_id": recovered_native_id, "recovered": True})
+                continue
             body = f"SDD project: {plan.slug}\nStable task: {task['stable_key']}\nRole: {task['role']}\nAcceptance criteria: {', '.join(c['id'] for c in plan.criteria)}\nDo not claim completion without submitting evidence through the SDD tools."
             result = self.bridge.create_task(board_slug, task["title"], body, task["role"], parents)
             native_id = self.bridge.decode_task_id(result.get("result") if isinstance(result, dict) else result)
