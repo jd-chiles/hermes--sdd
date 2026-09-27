@@ -1,0 +1,21 @@
+name: hermes-sdd-team
+version: 0.1.0
+description: Verified local repository delivery through adaptive specifications, durable evidence, and Hermes Kanban workers.
+author: Hermes SDD Team
+license: MIT
+tags:
+  - software-development
+  - kanban
+  - verification
+  - local-delivery
+provides_tools:
+  - sdd_initialize
+  - sdd_status
+  - sdd_admit_task
+  - sdd_submit_result
+  - sdd_verify
+  - sdd_accept
+  - sdd_doctor
+  - sdd_pause
+  - sdd_resume
+  - sdd_recover
