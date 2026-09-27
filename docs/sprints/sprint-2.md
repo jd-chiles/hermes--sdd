@@ -22,7 +22,7 @@ Prove that the public artifact loads through Hermes, preserve the host/plugin bo
 - [ ] Existing profiles, credentials, defaults, and unrelated plugins remain unchanged.
 - [x] The local SDD kernel completes a small regression fix through request → specification → worker result → review → evidence → acceptance.
 - [x] Interrupted dispatch can recover without duplicate task creation or lost ledger artifacts.
-- [ ] Release documentation includes the exact immutable install command and known compatibility gates.
+- [x] Release documentation includes the exact immutable install command and known compatibility gates.
 
 ## Exit evidence
 
