@@ -50,4 +50,12 @@ python -m pytest -q
 python -m compileall -q sdd_hermes
 ```
 
+Sprint 2 release checks build and inspect the real artifact:
+
+```bash
+python3 scripts/host_smoke.py
+```
+
+The smoke test extracts a tarball into a temporary directory and runs Hermes Plugin Doctor and validation there, so success does not depend on importing the source checkout.
+
 The `skills/` directory contains focused role guidance. Hermes loads only the skills registered by the plugin and can add them to task cards through its native Kanban mechanisms.
