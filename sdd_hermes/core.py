@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -116,13 +117,21 @@ class Ledger:
         self.paths.prepare()
         self._init_database()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
         connection = sqlite3.connect(self.paths.database, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 10000")
         connection.execute("PRAGMA journal_mode = WAL")
-        return connection
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _init_database(self) -> None:
         with self._connect() as db:
@@ -210,26 +219,30 @@ class Ledger:
         now = utc_now()
         selected_limits = {**DEFAULT_LIMITS, **(limits or {})}
         spec_content = {"request": request, "mode": mode, "criteria": criteria, "tasks": task_specs}
+        already_initialized = False
         with self._connect() as db:
             existing = db.execute("SELECT project_id FROM projects WHERE project_id = ?", (project_id,)).fetchone()
             if existing:
                 current = db.execute("SELECT request, mode FROM specs WHERE project_id = ? ORDER BY revision DESC LIMIT 1", (project_id,)).fetchone()
                 if current and (current["request"] != request or current["mode"] != mode):
                     raise SDDError("repository already has a different active SDD request; finish or recover it before starting another project")
-                return self.project(project_id) or {}
-            db.execute(
-                "INSERT INTO projects(project_id, root, board_slug, stage, paused, limits_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                (project_id, root, board_slug, "planned", 0, json_text(selected_limits), now, now),
-            )
-            db.execute(
-                "INSERT INTO specs(spec_id, project_id, slug, revision, mode, request, content_json, created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), project_id, slug, 1, mode, request, json_text(spec_content), now),
-            )
-            for index, task in enumerate(task_specs, start=1):
+                already_initialized = True
+            else:
                 db.execute(
-                    "INSERT INTO tasks(task_id, project_id, stable_key, title, role, kind, status, spec_revision, native_task_id, parent_key, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (f"{project_id}-T{index:03d}", project_id, task["stable_key"], task["title"], task["role"], task["kind"], "planned", 1, None, task.get("parent_key"), now, now),
+                    "INSERT INTO projects(project_id, root, board_slug, stage, paused, limits_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (project_id, root, board_slug, "planned", 0, json_text(selected_limits), now, now),
                 )
+                db.execute(
+                    "INSERT INTO specs(spec_id, project_id, slug, revision, mode, request, content_json, created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (str(uuid.uuid4()), project_id, slug, 1, mode, request, json_text(spec_content), now),
+                )
+                for index, task in enumerate(task_specs, start=1):
+                    db.execute(
+                        "INSERT INTO tasks(task_id, project_id, stable_key, title, role, kind, status, spec_revision, native_task_id, parent_key, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (f"{project_id}-T{index:03d}", project_id, task["stable_key"], task["title"], task["role"], task["kind"], "planned", 1, None, task.get("parent_key"), now, now),
+                    )
+        if already_initialized:
+            return self.project(project_id) or {}
         self.append_event(project_id, "project_initialized", {"mode": mode, "board_slug": board_slug, "limits": selected_limits})
         return self.project(project_id) or {}
 
