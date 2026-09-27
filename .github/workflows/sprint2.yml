@@ -69,5 +69,8 @@ jobs:
       - name: Run Linux host checks through WSL2
         shell: pwsh
         run: |
-          $path = $PWD.Path.Replace('\', '/')
-          wsl.exe bash -lc "cd /mnt$path && curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash && hermes plugins doctor . --ci && hermes plugins validate ."
+          $windowsPath = (Get-Location).Path
+          $drive = $windowsPath.Substring(0, 1).ToLowerInvariant()
+          $relativePath = $windowsPath.Substring(2).Replace('\', '/')
+          $wslPath = "/mnt/$drive$relativePath"
+          wsl.exe bash -lc "cd '$wslPath' && curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash && hermes plugins doctor . --ci && hermes plugins validate ."
