@@ -1,6 +1,6 @@
 # Release checklist
 
-Current verified revision: `2e5103a084cb1ac4611670a8bd4d381956767c03`
+Verified release baseline: `2e5103a084cb1ac4611670a8bd4d381956767c03`
 
 Install and enable the exact pushed revision:
 
