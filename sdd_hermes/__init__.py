@@ -41,6 +41,8 @@ class SDDService:
         board_slug = f"sdd-{plan.slug}"
         initial_fingerprint = repository_fingerprint(self.root)
         project = self.ledger.init_project(request, plan.mode, plan.slug, board_slug, plan.criteria, plan.tasks, limits)
+        replayed = project.pop('replayed', False)
+        board_slug = project['board_slug']
         spec_path = write_spec(self.paths, plan, self.ledger)
         self.ledger.append_event(project["project_id"], "initial_repository_snapshot", {"fingerprint": initial_fingerprint}, f"{project['project_id']}:initial-repository-snapshot")
         if execute and not self.bridge.available():
@@ -49,9 +51,8 @@ class SDDService:
             self.ledger.set_stage("dispatching")
             board = self.sync_board(plan, board_slug)
         else:
-            self.ledger.set_stage("planned")
             board = {"available": False, "message": "planning only"}
-        return {"project": self.ledger.project(), "spec_path": str(spec_path), "plan": plan.__dict__, "board": board}
+        return {"project": self.ledger.project(), "spec_path": str(spec_path), "plan": plan.__dict__, "board": board, "replayed": replayed}
 
     def sync_board(self, plan: Plan | None = None, board_slug: str | None = None) -> dict[str, Any]:
         if not plan:
@@ -68,17 +69,28 @@ class SDDService:
         provisioned = self.bridge.provision_profiles(profiles)
         board = self.bridge.ensure_board(board_slug, f"Hermes SDD — {plan.slug}")
         native: dict[str, str] = {}
+        recovered: set[str] = set()
         created: list[dict[str, Any]] = []
+        queued: list[str] = []
         routing = self.routing()
+        task_rows = {item["stable_key"]: item for item in self.ledger.tasks()}
         for task in plan.tasks:
-            task_row = next(item for item in self.ledger.tasks() if item["stable_key"] == task["stable_key"])
+            task_row = task_rows[task["stable_key"]]
             if task_row["native_task_id"]:
                 native[task["stable_key"]] = task_row["native_task_id"]
+                recovered.add(task["stable_key"])
                 continue
             parent_keys = task.get("parent_keys", [task["parent_key"]] if task.get("parent_key") else [])
+            # A newly created parent is still running. Its children remain queued
+            # until the parent reports a terminal success through complete_task.
+            terminal = {"completed", "accepted"}
             missing = [key for key in parent_keys if key not in native]
             if missing:
-                raise SDDError(f"cannot dispatch {task['stable_key']}: missing native parents {missing}")
+                queued.append(task["stable_key"])
+                continue
+            if any(key not in recovered and task_rows.get(key, {}).get("status") not in terminal for key in parent_keys):
+                queued.append(task["stable_key"])
+                continue
             parents = [native[key] for key in parent_keys]
             recovered_native_id = self.bridge.find_task(board_slug, task["stable_key"])
             if recovered_native_id:
@@ -86,6 +98,7 @@ class SDDService:
                 operation_id = f"{self.ledger.project()['project_id']}:dispatch:{task['stable_key']}"
                 self.ledger.complete_dispatch(operation_id, recovered_native_id) if self.ledger.dispatches() and any(item["operation_id"] == operation_id for item in self.ledger.dispatches()) else None
                 native[task["stable_key"]] = recovered_native_id
+                recovered.add(task["stable_key"])
                 created.append({"stable_key": task["stable_key"], "native_task_id": recovered_native_id, "recovered": True})
                 continue
             body = f"SDD project: {plan.slug}\nStable task: {task['stable_key']}\nRole: {task['role']}\nAcceptance criteria: {', '.join(c['id'] for c in plan.criteria)}\nDo not claim completion without submitting evidence through the SDD tools."
@@ -116,7 +129,7 @@ class SDDService:
                 self.ledger.complete_dispatch(operation_id, native_id, self.bridge.effective_route(raw_receipt))
                 native[task["stable_key"]] = native_id
             created.append({"stable_key": task["stable_key"], "native_task_id": native_id, "result": result, "effective_route": self.bridge.effective_route(result.get("result") if isinstance(result, dict) else result)})
-        return {"profiles": provisioned, "board": board, "created": created, "native_task_ids": native, "routing": routing}
+        return {"profiles": provisioned, "board": board, "created": created, "queued": queued, "native_task_ids": native, "routing": routing}
 
     def routing(self) -> dict[str, Any]:
         raw = os.environ.get("HERMES_SDD_ROUTES_JSON")
@@ -149,7 +162,7 @@ class SDDService:
         owned = self.ledger.acquire_ownership(task_id, self.actor, files, operation_id)
         return {"task_id": task_id, "owner": self.actor, "files": owned, "operation_id": operation_id}
 
-    def submit(self, task_id: str, spec_revision: int, changed_files: list[str], checks: list[str], summary: str, role: str | None = None, attempt_id: str | None = None) -> dict[str, Any]:
+    def submit(self, task_id: str, spec_revision: int, changed_files: list[str], checks: list[str], summary: str, role: str | None = None, attempt_id: str | None = None, verdict: str | None = None) -> dict[str, Any]:
         task = self.ledger.task(task_id)
         if not task:
             raise SDDError(f"unknown task: {task_id}")
@@ -158,8 +171,12 @@ class SDDService:
             raise SDDError(f"role mismatch: task requires {expected_role}; submission claimed {role}")
         if self.actor not in (expected_role, f"sdd-{expected_role}", "hermes-cli", "coordinator"):
             raise SDDError(f"host identity {self.actor!r} is not authorized for {expected_role} task {task_id}")
-        state = "accepted" if expected_role == "reviewer" else "submitted"
-        return self.ledger.create_attempt(task_id, self.actor, expected_role, spec_revision, changed_files, checks, summary, state, attempt_id)
+        if expected_role == "reviewer":
+            verdict = verdict or "approve"
+            if verdict not in {"approve", "request_changes"}:
+                raise SDDError("review verdict must be approve or request_changes")
+        state = "accepted" if expected_role == "reviewer" and verdict == "approve" else "submitted"
+        return self.ledger.create_attempt(task_id, self.actor, expected_role, spec_revision, changed_files, checks, summary, state, attempt_id, verdict)
 
     def verify(self, attempt_id: str, criterion_id: str, command: str, changed_files: list[str], timeout: int = 300) -> dict[str, Any]:
         return VerificationRunner(self.ledger, self.root).run(attempt_id, criterion_id, command, changed_files, timeout)
@@ -241,7 +258,16 @@ class SDDService:
         return {"admitted": True, "admission": admission, "native_task_id": task["native_task_id"], "result": receipt}
 
     def complete_task(self, operation_id: str, actual_seconds: int, state: str = "completed") -> dict[str, Any]:
-        return self.ledger.complete_capacity(operation_id, actual_seconds, state)
+        result = self.ledger.complete_capacity(operation_id, actual_seconds, state)
+        if state == "completed":
+            reservation = self.ledger.reservation(operation_id)
+            if reservation:
+                self.ledger.set_task_status(reservation["task_id"], "completed")
+                try:
+                    result["promoted"] = self.sync_board().get("created", [])
+                except SDDError as exc:
+                    result["promotion_blocked"] = str(exc)
+        return result
 
 
 def _root_from_params(params: dict[str, Any]) -> Path:
@@ -265,7 +291,7 @@ def _handle_tool(ctx: Any, name: str, params: dict[str, Any]) -> str:
         elif name == "admit":
             result = service.admit(params["task_id"], params.get("files", []), params.get("operation_id") or os.urandom(8).hex())
         elif name == "submit":
-            result = service.submit(params["task_id"], int(params["spec_revision"]), params.get("changed_files", []), params.get("checks", []), params["summary"], params.get("role"), params.get("attempt_id"))
+            result = service.submit(params["task_id"], int(params["spec_revision"]), params.get("changed_files", []), params.get("checks", []), params["summary"], params.get("role"), params.get("attempt_id"), params.get("verdict"))
         elif name == "verify":
             result = service.verify(params["attempt_id"], params["criterion_id"], params["command"], params.get("changed_files", []), int(params.get("timeout", 300)))
         elif name == "accept":
@@ -299,7 +325,7 @@ def _schemas() -> dict[str, dict[str, Any]]:
         "initialize": {"name": "sdd_initialize", "description": "Create or reconcile an SDD specification and stable task graph for a local repository request.", "parameters": {"type": "object", "properties": {"request": {"type": "string"}, "mode": {"type": "string", "enum": ["bugfix", "feature", "product"]}, "execute": {"type": "boolean"}, "task_assessments": {"type": "object", "description": "Per stable task key: dimensions (scope, uncertainty, coupling, consequence, verification) rated low/med/high, rationale, optional upward override."}, "project_root": root}, "required": ["request"]}},
         "status": {"name": "sdd_status", "description": "Show SDD stage, workers, task assignments, file ownership, checks, and blockers.", "parameters": {"type": "object", "properties": {"project_root": root}}},
         "admit": {"name": "sdd_admit_task", "description": "Atomically acquire explicit file ownership for an SDD task; overlapping ownership is rejected.", "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}, "files": {"type": "array", "items": {"type": "string"}}, "operation_id": {"type": "string"}, "project_root": root}, "required": ["task_id", "files"]}},
-        "submit": {"name": "sdd_submit_result", "description": "Submit an immutable worker result for SDD evaluation. Completion is not acceptance.", "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}, "attempt_id": {"type": "string"}, "spec_revision": {"type": "integer"}, "changed_files": {"type": "array", "items": {"type": "string"}}, "checks": {"type": "array", "items": {"type": "string"}}, "summary": {"type": "string"}, "role": {"type": "string"}, "project_root": root}, "required": ["task_id", "spec_revision", "summary"]}},
+        "submit": {"name": "sdd_submit_result", "description": "Submit an immutable worker result for SDD evaluation. Reviewer submissions require an explicit approve or request_changes verdict.", "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}, "attempt_id": {"type": "string"}, "spec_revision": {"type": "integer"}, "changed_files": {"type": "array", "items": {"type": "string"}}, "checks": {"type": "array", "items": {"type": "string"}}, "summary": {"type": "string"}, "role": {"type": "string"}, "verdict": {"type": "string", "enum": ["approve", "request_changes"]}, "project_root": root}, "required": ["task_id", "spec_revision", "summary"]}},
         "verify": {"name": "sdd_verify", "description": "Execute one explicit repository verification command and store immutable evidence with content fingerprints.", "parameters": {"type": "object", "properties": {"attempt_id": {"type": "string"}, "criterion_id": {"type": "string"}, "command": {"type": "string"}, "changed_files": {"type": "array", "items": {"type": "string"}}, "timeout": {"type": "integer"}, "project_root": root}, "required": ["attempt_id", "criterion_id", "command"]}},
         "accept": {"name": "sdd_accept", "description": "Evaluate project acceptance: required evidence, passing checks, current fingerprints, engineer result, and independent review.", "parameters": {"type": "object", "properties": {"project_root": root}}},
         "close": {"name": "sdd_close", "description": "Close an accepted SDD request while preserving its ledger and evidence history for future requests.", "parameters": {"type": "object", "properties": {"project_root": root}}},

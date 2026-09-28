@@ -14,7 +14,7 @@
 
 ## Current sprint
 
-[Sprint 5](sprints/sprint-5.md) prioritizes request lifecycle and enforceable operational limits. Sprint 4 delivered local recovery budgets, native idempotency, and guarded native promotion; installed-host certification remains an external gate.
+[Sprint 7](sprints/sprint-7.md) targets dependency-aware scheduling, durable completion receipts, finalized verification contracts, explicit review, and associated diagnostics. Its [full development package](sdd/features/sprint-7-contract-enforcement/spec.md) defines the architecture, migration, stable tasks, and 18 acceptance scenarios. Implementation has partially started with basic empty-submission guards; remaining sprint gates are pending. [Sprint 6](sprints/sprint-6.md) retains broader production-readiness work and native host certification.
 
 ## Release and follow-up gates (see Sprint 2 for collected evidence)
 

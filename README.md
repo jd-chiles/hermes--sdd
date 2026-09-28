@@ -51,7 +51,7 @@ python3 -m unittest discover -s tests -v
 python3 -m compileall -q sdd_hermes scripts
 ```
 
-Sprint 5 is underway: see the [sprint backlog](docs/sprints/sprint-5.md) and [spec-driven development package](docs/sdd/features/sprint-5-lifecycle/).
+Sprint 7 focuses on scheduling and verification contracts: see the [sprint backlog](docs/sprints/sprint-7.md) and [full SDD package](docs/sdd/features/sprint-7-contract-enforcement/spec.md). Basic acceptance guards are implemented; the remaining contract and scheduler work is specified. Broader production-readiness and native host certification remain tracked in [Sprint 6](docs/sprints/sprint-6.md).
 
 Release checks build and inspect the real artifact:
 

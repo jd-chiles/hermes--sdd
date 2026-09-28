@@ -132,7 +132,7 @@ class CoordinationTests(unittest.TestCase):
             blocked = service.ledger.admit_capacity(service.ledger.tasks()[1]['task_id'], 'runtime-2', 'coordinator', 300)
             self.assertTrue(allowed['allowed'])
             self.assertEqual(blocked['blocked'], 'total_runtime')
-            self.assertEqual(service.status()['limit_blockers'][0]['unblock_condition'], 'complete an active reservation or increase the total runtime cap')
+            self.assertIn('consumed time is retained', service.status()['limit_blockers'][0]['unblock_condition'])
 
     def test_failure_recovery_is_durable_and_does_not_change_task_tier(self):
         task = self.service.ledger.tasks()[0]

@@ -1,6 +1,6 @@
 # Sprint 5 — request lifecycle and operational limits
 
-Status: active, 2026-09-28. Lifecycle and local operational-limit slices are implemented and validated; host lifecycle capability gating remains open.
+Status: implementation baseline, 2026-09-28; remaining work is carried into [Sprint 6](sprint-6.md). Lifecycle and local operational-limit slices have local test evidence; native host certification remains open. The [Sprint 6 review baseline](../sdd/features/sprint-6-production-readiness/spec.md) records additional lifecycle and budget defects, so the delivered slices below must not be read as complete production guarantees.
 
 ## Delivered this cycle
 

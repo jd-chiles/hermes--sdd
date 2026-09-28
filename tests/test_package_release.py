@@ -62,3 +62,29 @@ class PackageReleaseTests(unittest.TestCase):
                 self.skipTest('symlink creation unavailable')
             with self.assertRaises(ValueError):
                 build(root, Path(directory) / 'plugin.tar.gz')
+
+    def test_equivalent_output_path_excludes_previous_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / 'README.md').write_text('test')
+            (root / 'docs/child').mkdir(parents=True)
+            output = root / 'docs/child/../release.tar.gz'
+            first = build(root, output)
+            second = build(root, output)
+            self.assertEqual(second['files'], ['README.md'])
+            self.assertEqual(first['sha256'], second['sha256'])
+
+    def test_output_parent_alias_excludes_previous_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'source'
+            (root / 'docs').mkdir(parents=True)
+            (root / 'README.md').write_text('test')
+            alias = Path(directory) / 'alias'
+            try:
+                alias.symlink_to(root, target_is_directory=True)
+            except OSError:
+                self.skipTest('directory symlinks unavailable')
+            first = build(root, alias / 'docs/release.tar.gz')
+            second = build(root, alias / 'docs/release.tar.gz')
+            self.assertEqual(second['files'], ['README.md'])
+            self.assertEqual(first['sha256'], second['sha256'])

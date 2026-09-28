@@ -1,0 +1,70 @@
+{
+  "capabilities": {
+    "attempt_receipts": {
+      "command": "runs",
+      "reason": "source declarations do not verify runtime semantics or receipts",
+      "required_flags": [],
+      "source_declared": true,
+      "state": "unverified"
+    },
+    "interruption": {
+      "command": "block",
+      "reason": "source declarations do not verify runtime semantics or receipts",
+      "required_flags": [],
+      "source_declared": true,
+      "state": "unverified"
+    },
+    "promotion": {
+      "command": "promote",
+      "reason": "source declarations do not verify runtime semantics or receipts",
+      "required_flags": [],
+      "source_declared": true,
+      "state": "unverified"
+    },
+    "review_transition": {
+      "command": "request-review",
+      "reason": "source declarations do not verify runtime semantics or receipts",
+      "required_flags": [],
+      "source_declared": true,
+      "state": "unverified"
+    },
+    "runtime_deadline": {
+      "command": "create",
+      "reason": "source declarations do not verify runtime semantics or receipts",
+      "required_flags": [
+        "--max-runtime"
+      ],
+      "source_declared": true,
+      "state": "unverified"
+    },
+    "task_creation": {
+      "command": "create",
+      "reason": "source declarations do not verify runtime semantics or receipts",
+      "required_flags": [
+        "--idempotency-key",
+        "--initial-status"
+      ],
+      "source_declared": true,
+      "state": "unverified"
+    },
+    "task_inspection": {
+      "command": "show",
+      "reason": "source declarations do not verify runtime semantics or receipts",
+      "required_flags": [],
+      "source_declared": true,
+      "state": "unverified"
+    }
+  },
+  "certified": false,
+  "cli_startup": {
+    "exit_status": 1,
+    "reason": "ruamel.yaml dependency is unavailable",
+    "state": "blocked"
+  },
+  "executable_checkout_binding": "unverified",
+  "host_revision": "8f897d2d23a338f7a062ebc4fa7aedc287d087de",
+  "next_action": "repair host startup if blocked, then collect real isolated lifecycle receipts against this revision",
+  "parser_sha256": "bad2147005a85070a3a9444f25bed7d9f55132f1c98bc4f08befd48d7aeb4a97",
+  "source_dirty": false,
+  "worker_launched": false
+}

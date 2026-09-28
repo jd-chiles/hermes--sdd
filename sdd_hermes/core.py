@@ -9,18 +9,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shlex
 import sqlite3
 import subprocess
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DEFAULT_LIMITS = {"max_workers": 3, "max_repairs": 2, "max_provider_recoveries": 2, "max_native_retries": 3, "max_runtime_seconds": 3600, "max_total_runtime_seconds": 3600, "estimated_runtime_seconds": 300}
 
 
@@ -114,8 +115,35 @@ class Ledger:
 
     def __init__(self, paths: ProjectPaths):
         self.paths = paths
+        # Refuse future schemas before WAL setup, DDL, or directory creation.
+        if self.paths.database.exists():
+            with closing(sqlite3.connect(self.paths.database.resolve().as_uri() + '?mode=ro', uri=True)) as db:
+                self._schema_version(db)
         self.paths.prepare()
         self._init_database()
+
+    @staticmethod
+    def _schema_version(db) -> int:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata'").fetchone():
+            return 0
+        row = db.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()
+        version = int(row[0]) if row else 0
+        if version > SCHEMA_VERSION:
+            raise SDDError("ledger was written by a newer plugin; upgrade before continuing")
+        return version
+
+    @staticmethod
+    def _execute_schema(db, script: str) -> None:
+        # executescript() implicitly commits; execute complete statements instead
+        # so schema changes and the version stamp share the migration transaction.
+        statement = ''
+        for line in script.splitlines(keepends=True):
+            statement += line
+            if sqlite3.complete_statement(statement):
+                db.execute(statement)
+                statement = ''
+        if statement.strip():
+            raise SDDError('incomplete schema statement')
 
     @contextmanager
     def _connect(self):
@@ -135,7 +163,16 @@ class Ledger:
 
     def _init_database(self) -> None:
         with self._connect() as db:
-            db.executescript(
+            db.execute('BEGIN IMMEDIATE')
+            version = self._schema_version(db)
+            if version and version < SCHEMA_VERSION:
+                # A separate reader sees the committed snapshot while this
+                # connection holds the writer lock. Include committed WAL data.
+                backup = self.paths.database.with_name(f'ledger.pre-v{SCHEMA_VERSION}-{uuid.uuid4().hex}.sqlite3')
+                with closing(sqlite3.connect(self.paths.database.resolve().as_uri() + '?mode=ro', uri=True)) as source:
+                    with closing(sqlite3.connect(backup)) as destination:
+                        source.backup(destination)
+            self._execute_schema(db,
                 """
                 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS projects (
@@ -148,6 +185,14 @@ class Ledger:
                     slug TEXT NOT NULL, revision INTEGER NOT NULL, mode TEXT NOT NULL,
                     request TEXT NOT NULL, content_json TEXT NOT NULL, created_at INTEGER NOT NULL,
                     UNIQUE(project_id, slug, revision)
+                );
+                CREATE TABLE IF NOT EXISTS request_repositories (
+                    project_id TEXT PRIMARY KEY REFERENCES projects(project_id),
+                    root TEXT NOT NULL, spec_path TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS active_requests (
+                    root TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL UNIQUE REFERENCES projects(project_id)
                 );
                 CREATE TABLE IF NOT EXISTS tasks (
                     task_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(project_id),
@@ -172,6 +217,11 @@ class Ledger:
                 CREATE TABLE IF NOT EXISTS attempt_context (
                     attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
                     engineer_ids_json TEXT NOT NULL, content_fingerprint TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS review_verdicts (
+                    attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+                    verdict TEXT NOT NULL, rationale TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL
                 );
                 CREATE TRIGGER IF NOT EXISTS context_immutable_update
                     BEFORE UPDATE ON attempt_context BEGIN SELECT RAISE(ABORT, 'attempt context is immutable'); END;
@@ -243,9 +293,6 @@ class Ledger:
                     BEFORE DELETE ON evidence BEGIN SELECT RAISE(ABORT, 'evidence is immutable'); END;
                 """
             )
-            version = db.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()
-            if version and int(version[0]) > SCHEMA_VERSION:
-                raise SDDError("ledger was written by a newer plugin; upgrade before continuing")
             columns = {row["name"] for row in db.execute("PRAGMA table_info(dispatches)")}
             if "effective_route_json" not in columns:
                 db.execute("ALTER TABLE dispatches ADD COLUMN effective_route_json TEXT NOT NULL DEFAULT '{}'")
@@ -254,7 +301,28 @@ class Ledger:
                 db.execute("ALTER TABLE route_breakers ADD COLUMN state TEXT NOT NULL DEFAULT 'closed'")
             if "half_open_claimed" not in breaker_columns:
                 db.execute("ALTER TABLE route_breakers ADD COLUMN half_open_claimed INTEGER NOT NULL DEFAULT 0")
+            if version < 6:
+                self._migrate_request_associations(db)
             db.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
+
+    def _migrate_request_associations(self, db) -> None:
+        for project in db.execute('SELECT * FROM projects').fetchall():
+            root = project['root']
+            suffix = re.search(r'#closed-' + re.escape(project['project_id']) + r'-\d+$', root)
+            if suffix:
+                if project['stage'] != 'closed':
+                    raise SDDError('ambiguous archived request; restore/repair the v5 ledger before migration')
+                root = root[:suffix.start()]
+            root = str(Path(root).resolve())
+            spec = db.execute('SELECT slug FROM specs WHERE project_id = ? ORDER BY revision DESC LIMIT 1', (project['project_id'],)).fetchone()
+            if not spec:
+                raise SDDError('request has no specification; repair before migration')
+            spec_path = f"docs/sdd/features/{spec['slug']}/spec.md"
+            db.execute('INSERT INTO request_repositories VALUES(?,?,?)', (project['project_id'], root, spec_path))
+            if project['stage'] not in {'closed', 'abandoned'}:
+                if db.execute('SELECT 1 FROM active_requests WHERE root = ?', (root,)).fetchone():
+                    raise SDDError('multiple active requests resolve to the same repository; repair before migration')
+                db.execute('INSERT INTO active_requests VALUES(?,?)', (root, project['project_id']))
 
     def append_event(self, project_id: str, event_type: str, payload: Mapping[str, Any], operation_id: str | None = None) -> bool:
         operation_id = operation_id or str(uuid.uuid4())
@@ -270,32 +338,36 @@ class Ledger:
         return True
 
     def init_project(self, request: str, mode: str, slug: str, board_slug: str, criteria: list[dict[str, Any]], task_specs: list[dict[str, Any]], limits: Mapping[str, int] | None = None) -> dict[str, Any]:
-        root = str(self.paths.root)
-        project_id = hashlib.sha256(root.encode("utf-8")).hexdigest()[:16]
+        root = str(self.paths.root.resolve())
+        project_id = uuid.uuid4().hex[:16]
         now = utc_now()
         selected_limits = {**DEFAULT_LIMITS, **(limits or {})}
         spec_content = {"request": request, "mode": mode, "criteria": criteria, "tasks": task_specs}
         already_initialized = False
         with self._connect() as db:
-            existing = db.execute("SELECT project_id FROM projects WHERE project_id = ?", (project_id,)).fetchone()
+            db.execute('BEGIN IMMEDIATE')
+            existing = db.execute("SELECT project_id FROM active_requests WHERE root = ?", (root,)).fetchone()
             if existing:
+                project_id = existing['project_id']
                 project = db.execute("SELECT * FROM projects WHERE project_id = ?", (project_id,)).fetchone()
                 current = db.execute("SELECT request, mode, content_json FROM specs WHERE project_id = ? ORDER BY revision DESC LIMIT 1", (project_id,)).fetchone()
-                if project["stage"] != "closed":
-                    if current and (current["request"] != request or current["mode"] != mode):
-                        raise SDDError("repository already has a different active SDD request; close it after acceptance before starting another project")
-                    if current and current["content_json"] != json_text(spec_content):
-                        raise SDDError("existing specification differs; explicit revision required before changing task policy")
-                    already_initialized = True
-                else:
-                    archived_root = f"{root}#closed-{project_id}-{now}"
-                    db.execute("UPDATE projects SET root = ?, updated_at = ? WHERE project_id = ?", (archived_root, now, project_id))
-                    project_id = hashlib.sha256(f"{root}\0{request}\0{now}\0{uuid.uuid4()}".encode("utf-8")).hexdigest()[:16]
+                if current and (current["request"] != request or current["mode"] != mode):
+                    raise SDDError("repository already has a different active SDD request; close it after acceptance before starting another project")
+                if current and current["content_json"] != json_text(spec_content):
+                    raise SDDError("existing specification differs; explicit revision required before changing task policy")
+                if limits is not None and json.loads(project['limits_json']) != selected_limits:
+                    raise SDDError('existing limits differ; explicit revision required before changing limits')
+                already_initialized = True
             if not already_initialized:
+                board_slug = f'{board_slug[:40]}-{project_id}'
                 db.execute(
                     "INSERT INTO projects(project_id, root, board_slug, stage, paused, limits_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (project_id, root, board_slug, "planned", 0, json_text(selected_limits), now, now),
+                    # Retain the legacy UNIQUE root column as an immutable
+                    # storage key; request_repositories owns canonical roots.
+                    (project_id, f'request:{project_id}', board_slug, "planned", 0, json_text(selected_limits), now, now),
                 )
+                db.execute('INSERT INTO request_repositories VALUES(?,?,?)', (project_id, root, f'docs/sdd/features/{slug}-{project_id}/spec.md'))
+                db.execute('INSERT INTO active_requests VALUES(?,?)', (root, project_id))
                 db.execute(
                     "INSERT INTO specs(spec_id, project_id, slug, revision, mode, request, content_json, created_at) VALUES(?,?,?,?,?,?,?,?)",
                     (str(uuid.uuid4()), project_id, slug, 1, mode, request, json_text(spec_content), now),
@@ -305,10 +377,9 @@ class Ledger:
                         "INSERT INTO tasks(task_id, project_id, stable_key, title, role, kind, status, spec_revision, native_task_id, parent_key, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                         (f"{project_id}-T{index:03d}", project_id, task["stable_key"], task["title"], task["role"], task["kind"], "planned", 1, None, task.get("parent_key"), now, now),
                     )
-        if already_initialized:
-            return self.project(project_id) or {}
-        self.append_event(project_id, "project_initialized", {"mode": mode, "board_slug": board_slug, "limits": selected_limits})
-        return self.project(project_id) or {}
+                db.execute('INSERT INTO events VALUES(?,?,?,?,?,?)', (str(uuid.uuid4()), project_id, f'{project_id}:initialized', 'project_initialized', json_text({'mode': mode, 'board_slug': board_slug, 'limits': selected_limits}), now))
+        self.export_jsonl()
+        return {**(self.project(project_id) or {}), 'replayed': already_initialized}
 
     def project(self, project_id: str | None = None) -> dict[str, Any] | None:
         with self._connect() as db:
@@ -316,14 +387,21 @@ class Ledger:
             if not row:
                 return None
             result = dict(row)
+            association = db.execute('SELECT root, spec_path FROM request_repositories WHERE project_id = ?', (row['project_id'],)).fetchone()
+            if association:
+                result.update(dict(association))
             result["limits"] = json.loads(result.pop("limits_json"))
             result["paused"] = bool(result["paused"])
             return result
 
     def project_id(self) -> str | None:
-        root = str(self.paths.root)
+        root = str(self.paths.root.resolve())
         with self._connect() as db:
-            row = db.execute("SELECT project_id FROM projects WHERE root = ?", (root,)).fetchone()
+            row = db.execute("SELECT project_id FROM active_requests WHERE root = ?", (root,)).fetchone()
+            if not row:
+                # Preserve status/close replay for the most recently terminal
+                # request until the next active request is initialized.
+                row = db.execute('SELECT p.project_id FROM projects p JOIN request_repositories r ON r.project_id = p.project_id WHERE r.root = ? ORDER BY p.rowid DESC LIMIT 1', (root,)).fetchone()
             return row[0] if row else None
 
     def set_stage(self, stage: str, paused: bool | None = None) -> None:
@@ -331,6 +409,9 @@ class Ledger:
         if not project_id:
             raise SDDError("project is not initialized; run /sdd plan or /sdd build first")
         with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('SELECT stage FROM projects WHERE project_id = ?', (project_id,)).fetchone()[0] in {'closed', 'abandoned'}:
+                raise SDDError('terminal requests cannot change stage')
             if paused is None:
                 db.execute("UPDATE projects SET stage = ?, updated_at = ? WHERE project_id = ?", (stage, utc_now(), project_id))
             else:
@@ -347,11 +428,13 @@ class Ledger:
                 return {"closed": True, "project_id": project_id, "idempotent": True}
             if project["paused"] or project["stage"] != "accepted":
                 raise SDDError("only an unpaused accepted project can be closed")
-            active = db.execute("SELECT COUNT(*) FROM worker_reservations WHERE project_id = ? AND state IN ('reserved', 'running')", (project_id,)).fetchone()[0]
+            active = db.execute("SELECT COUNT(*) FROM worker_reservations WHERE project_id = ? AND state IN ('reserved', 'running', 'ambiguous')", (project_id,)).fetchone()[0]
             if active:
                 raise SDDError("cannot close while worker reservations are active")
             db.execute("UPDATE projects SET stage = 'closed', updated_at = ? WHERE project_id = ?", (utc_now(), project_id))
-        self.append_event(project_id, "project_closed", {"stage": "accepted"}, f"{project_id}:closed")
+            db.execute('DELETE FROM active_requests WHERE project_id = ?', (project_id,))
+            db.execute('INSERT INTO events VALUES(?,?,?,?,?,?)', (str(uuid.uuid4()), project_id, f'{project_id}:closed', 'project_closed', json_text({'stage': 'accepted'}), utc_now()))
+        self.export_jsonl()
         return {"closed": True, "project_id": project_id, "idempotent": False}
 
     def tasks(self) -> list[dict[str, Any]]:
@@ -385,14 +468,21 @@ class Ledger:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute("SELECT * FROM worker_reservations WHERE operation_id = ?", (operation_id,)).fetchone()
             if existing:
-                return {**dict(existing), "allowed": existing["state"] in {"reserved", "running"}, "replayed": True}
-            project = db.execute("SELECT paused, limits_json FROM projects WHERE project_id = ?", (project_id,)).fetchone()
+                if (existing['task_id'], existing['holder'], existing['reserved_seconds']) != (task_id, holder, runtime_seconds):
+                    raise SDDError('capacity operation ID was already used with different inputs')
+                return {**dict(existing), "allowed": existing["state"] in {"reserved", "running"}, "replayed": True,
+                        'blocked': 'reconcile_reservation', 'unblock_condition': 'reconcile the existing capacity operation'}
+            project = db.execute("SELECT stage, paused, limits_json FROM projects WHERE project_id = ?", (project_id,)).fetchone()
+            if project['stage'] in {'closed', 'abandoned'}:
+                raise SDDError('terminal requests cannot reserve capacity')
             limits = json.loads(project["limits_json"])
             max_workers = int(limits.get("max_workers", DEFAULT_LIMITS["max_workers"]))
             max_runtime = int(limits.get("max_runtime_seconds", DEFAULT_LIMITS["max_runtime_seconds"]))
             max_total_runtime = int(limits.get("max_total_runtime_seconds", DEFAULT_LIMITS["max_total_runtime_seconds"]))
-            active = db.execute("SELECT COUNT(*) FROM worker_reservations WHERE project_id = ? AND state IN ('reserved', 'running')", (project_id,)).fetchone()[0]
-            reserved_runtime = db.execute("SELECT COALESCE(SUM(reserved_seconds), 0) FROM runtime_reservations WHERE project_id = ? AND state IN ('reserved', 'running')", (project_id,)).fetchone()[0]
+            active = db.execute("SELECT COUNT(*) FROM worker_reservations WHERE project_id = ? AND state IN ('reserved', 'running', 'ambiguous')", (project_id,)).fetchone()[0]
+            exposure = "CASE WHEN state IN ('reserved', 'running', 'ambiguous') THEN MAX(reserved_seconds, actual_seconds) ELSE actual_seconds END"
+            total_runtime = db.execute(f"SELECT COALESCE(SUM({exposure}), 0) FROM runtime_reservations WHERE project_id = ?", (project_id,)).fetchone()[0]
+            task_runtime = db.execute(f"SELECT COALESCE(SUM({exposure}), 0) FROM runtime_reservations WHERE task_id = ?", (task_id,)).fetchone()[0]
 
             def blocked(limit_name: str, usage: int, cap: int, condition: str) -> dict[str, Any]:
                 blocker_id = str(uuid.uuid4())
@@ -401,32 +491,51 @@ class Ledger:
 
             if project["paused"]:
                 return blocked("paused", 1, 0, "resume the project")
-            if runtime_seconds <= 0 or runtime_seconds > max_runtime:
-                return blocked("task_runtime", runtime_seconds, max_runtime, "choose a runtime within the configured cap")
+            if runtime_seconds <= 0 or task_runtime + runtime_seconds > max_runtime:
+                return blocked("task_runtime", task_runtime + runtime_seconds, max_runtime, "choose a runtime within the remaining task budget")
             if active >= max_workers:
                 return blocked("max_workers", active, max_workers, "complete or release an active worker reservation")
-            if reserved_runtime + runtime_seconds > max_total_runtime:
-                return blocked("total_runtime", reserved_runtime + runtime_seconds, max_total_runtime, "complete an active reservation or increase the total runtime cap")
+            if total_runtime + runtime_seconds > max_total_runtime:
+                return blocked("total_runtime", total_runtime + runtime_seconds, max_total_runtime, "reconcile unused reservations or explicitly revise the total runtime cap; consumed time is retained")
             db.execute("INSERT INTO worker_reservations(operation_id, project_id, task_id, holder, state, reserved_seconds, reserved_at, released_at) VALUES(?,?,?,?,?,?,?,NULL)", (operation_id, project_id, task_id, holder, "reserved", runtime_seconds, now))
             db.execute("INSERT INTO runtime_reservations(operation_id, project_id, task_id, reserved_seconds, actual_seconds, state, started_at, completed_at) VALUES(?,?,?,?,?,?,?,NULL)", (operation_id, project_id, task_id, runtime_seconds, 0, "reserved", now))
+            db.execute('UPDATE limit_blockers SET resolved_at = ? WHERE project_id = ? AND operation_id = ? AND resolved_at IS NULL', (now, project_id, operation_id))
             return {"allowed": True, "operation_id": operation_id, "task_id": task_id, "reserved_seconds": runtime_seconds, "replayed": False}
 
     def complete_capacity(self, operation_id: str, actual_seconds: int, state: str = "completed") -> dict[str, Any]:
         if state not in {"completed", "failed", "released", "ambiguous"}:
             raise SDDError(f"invalid capacity completion state: {state}")
+        if not isinstance(actual_seconds, int) or isinstance(actual_seconds, bool) or actual_seconds < 0:
+            raise SDDError('actual runtime must be a nonnegative integer')
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             reservation = db.execute("SELECT * FROM worker_reservations WHERE operation_id = ?", (operation_id,)).fetchone()
             runtime = db.execute("SELECT * FROM runtime_reservations WHERE operation_id = ?", (operation_id,)).fetchone()
             if not reservation or not runtime:
                 raise SDDError("unknown capacity reservation")
-            if reservation["state"] not in {"reserved", "running"}:
+            if reservation["state"] not in {"reserved", "running", "ambiguous"}:
+                if reservation['state'] != state or runtime['actual_seconds'] != actual_seconds:
+                    raise SDDError('capacity completion was already recorded with different inputs')
                 return {"operation_id": operation_id, "state": reservation["state"], "idempotent": True}
+            if actual_seconds < runtime['actual_seconds']:
+                raise SDDError('actual runtime cannot decrease during reconciliation')
             now = utc_now()
-            db.execute("UPDATE worker_reservations SET state = ?, released_at = ? WHERE operation_id = ?", (state, now, operation_id))
-            db.execute("UPDATE runtime_reservations SET state = ?, actual_seconds = ?, completed_at = ? WHERE operation_id = ?", (state, max(0, int(actual_seconds)), now, operation_id))
-            db.execute("UPDATE limit_blockers SET resolved_at = ? WHERE project_id = ? AND resolved_at IS NULL AND limit_name IN ('max_workers', 'total_runtime')", (now, reservation["project_id"]))
-            return {"operation_id": operation_id, "state": state, "actual_seconds": max(0, int(actual_seconds)), "idempotent": False}
+            terminal_at = None if state == 'ambiguous' else now
+            db.execute("UPDATE worker_reservations SET state = ?, released_at = ? WHERE operation_id = ?", (state, terminal_at, operation_id))
+            db.execute("UPDATE runtime_reservations SET state = ?, actual_seconds = ?, completed_at = ? WHERE operation_id = ?", (state, actual_seconds, terminal_at, operation_id))
+            # Completion does not prove every runtime blocker has been resolved.
+            active = db.execute("SELECT COUNT(*) FROM worker_reservations WHERE project_id = ? AND state IN ('reserved', 'running', 'ambiguous')", (reservation['project_id'],)).fetchone()[0]
+            limits = json.loads(db.execute('SELECT limits_json FROM projects WHERE project_id = ?', (reservation['project_id'],)).fetchone()[0])
+            if active < int(limits.get('max_workers', DEFAULT_LIMITS['max_workers'])):
+                db.execute("UPDATE limit_blockers SET resolved_at = ? WHERE project_id = ? AND resolved_at IS NULL AND limit_name = 'max_workers'", (now, reservation['project_id']))
+            db.execute('INSERT INTO events VALUES(?,?,?,?,?,?)', (str(uuid.uuid4()), reservation['project_id'], str(uuid.uuid4()), 'capacity_reconciled', json_text({'operation_id': operation_id, 'state': state, 'actual_seconds': actual_seconds}), now))
+        self.export_jsonl()
+        return {"operation_id": operation_id, "state": state, "actual_seconds": actual_seconds, "idempotent": False}
+
+    def reservation(self, operation_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM worker_reservations WHERE operation_id = ?", (operation_id,)).fetchone()
+            return dict(row) if row else None
 
     def capacity(self) -> list[dict[str, Any]]:
         project_id = self.project_id()
@@ -603,7 +712,7 @@ class Ledger:
             "(SELECT MAX(b.attempt_no) FROM attempts b WHERE b.task_id = a.task_id) "
             "ORDER BY a.task_id", (project_id,))]
 
-    def create_attempt(self, task_id: str, actor: str, role: str, spec_revision: int, changed_files: Sequence[str], checks: Sequence[str], summary: str, state: str = "submitted", attempt_id: str | None = None) -> dict[str, Any]:
+    def create_attempt(self, task_id: str, actor: str, role: str, spec_revision: int, changed_files: Sequence[str], checks: Sequence[str], summary: str, state: str = "submitted", attempt_id: str | None = None, verdict: str | None = None) -> dict[str, Any]:
         attempt_id = attempt_id or str(uuid.uuid4())
         normalized = sorted({safe_relative(self.paths.root, path) for path in changed_files})
         with self._connect() as db:
@@ -624,6 +733,10 @@ class Ledger:
                 (attempt_id, task_id, attempt_no, actor, role, spec_revision, json_text(normalized), json_text(list(checks)), summary, state, utc_now()),
             )
             db.execute("INSERT INTO attempt_context VALUES(?,?,?)", (attempt_id, json_text(engineers), file_fingerprint(self.paths.root, normalized)))
+            if role == "reviewer":
+                if verdict not in {"approve", "request_changes"}:
+                    raise SDDError("review verdict must be approve or request_changes")
+                db.execute("INSERT INTO review_verdicts(attempt_id, verdict, rationale, created_at) VALUES(?,?,?,?)", (attempt_id, verdict, summary, utc_now()))
             db.execute("UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?", ("review" if role == "engineer" else "submitted", utc_now(), task_id))
             db.execute("UPDATE projects SET stage = CASE WHEN paused = 1 THEN 'paused' ELSE 'review' END, updated_at = ? WHERE project_id = ?", (utc_now(), task["project_id"]))
         return {"attempt_id": attempt_id, "attempt_no": attempt_no, "task_id": task_id}
@@ -692,6 +805,11 @@ class Ledger:
             for task in db.execute("SELECT task_id FROM tasks WHERE project_id = ? AND role = 'engineer'", (project_id,)):
                 if task["task_id"] not in {a["task_id"] for a in engineers}:
                     reasons.append("engineer submission is missing")
+            for attempt in engineers:
+                if not json.loads(attempt["changed_files_json"]):
+                    reasons.append(f"engineer submission {attempt['attempt_id']} has empty implementation scope")
+                if not json.loads(attempt["checks_json"]):
+                    reasons.append(f"engineer submission {attempt['attempt_id']} declares no required checks")
             eligible = {}
             for attempt in attempts:
                 context = contexts.get(attempt["attempt_id"])
@@ -711,6 +829,10 @@ class Ledger:
             reviewers = [a for a in eligible.values() if a["role"] == "reviewer" and a["actor"] not in engineer_actors and engineer_files <= set(json.loads(a["changed_files_json"]))]
             if not reviewers:
                 reasons.append("independent reviewer submission is missing")
+            for reviewer in reviewers:
+                verdict = db.execute("SELECT verdict FROM review_verdicts WHERE attempt_id = ?", (reviewer["attempt_id"],)).fetchone()
+                if not verdict or verdict["verdict"] != "approve":
+                    reasons.append(f"reviewer verdict requests changes for {reviewer['task_id']}")
             evidence = [dict(row) for row in db.execute(
                 "SELECT e.* FROM evidence e JOIN attempts a ON a.attempt_id = e.attempt_id JOIN tasks t ON t.task_id = a.task_id WHERE t.project_id = ? ORDER BY e.rowid", (project_id,))]
             latest = {}

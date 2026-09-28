@@ -40,7 +40,7 @@ def files_for(root: Path, excluded: set[Path] | None = None) -> list[Path]:
 
 def build(root: Path, output: Path) -> dict[str, object]:
     root = root.resolve()
-    output = output.absolute()
+    output = output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     manifest_path = output.with_suffix(output.suffix + ".json")
     files = files_for(root, {output, manifest_path})

@@ -90,9 +90,14 @@ def build_plan(request: str, explicit_mode: str | None = None, task_assessments:
 
 
 def write_spec(paths: ProjectPaths, plan: Plan, ledger: Ledger) -> Path:
-    feature_dir = paths.features / plan.slug
+    project = ledger.project()
+    if not project:
+        raise SDDError('project is not initialized')
+    spec_path = paths.root / project['spec_path']
+    feature_dir = spec_path.parent
     feature_dir.mkdir(parents=True, exist_ok=True)
-    spec_path = feature_dir / "spec.md"
+    if spec_path.exists():
+        return spec_path
     lines = [
         f"# {plan.slug}",
         "",
@@ -114,7 +119,11 @@ def write_spec(paths: ProjectPaths, plan: Plan, ledger: Ledger) -> Path:
         lines.append(f"- **{task['stable_key']}** ({task['role']}; difficulty: {task['difficulty']['tier']}) — {task['title']}{dependency}")
         lines.append(f"  - Assessment: {task['difficulty']['rationale']}")
     lines.extend(["", "## Limits", "", "- Maximum concurrent workers: 3", "- Maximum repair cycles per task: 2", "- Maximum provider recovery launches per task: 2", "- Native consecutive-failure breaker: 3", "- Maximum run duration: 60 minutes", ""])
-    spec_path.write_text("\n".join(lines), encoding="utf-8")
+    try:
+        with spec_path.open('x', encoding='utf-8') as stream:
+            stream.write("\n".join(lines))
+    except FileExistsError:
+        pass  # An identical initialization won the artifact creation race.
     return spec_path
 
 
