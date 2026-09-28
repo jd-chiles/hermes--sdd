@@ -37,7 +37,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Hermes
         shell: bash
-        run: curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+        # Download-then-execute rather than `curl | bash`: the installer is
+        # fetched, written to disk, and run only after the transfer succeeds,
+        # and the Hermes revision is pinned for a reproducible contract run.
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/hermes-install.sh https://hermes-agent.nousresearch.com/install.sh
+          bash /tmp/hermes-install.sh --commit 8f897d2d23a338f7a062ebc4fa7aedc287d087de --non-interactive
       - name: Plugin Doctor
         run: hermes plugins doctor . --ci
       - name: Plugin validation
@@ -51,7 +57,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Hermes
         shell: bash
-        run: curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/hermes-install.sh https://hermes-agent.nousresearch.com/install.sh
+          bash /tmp/hermes-install.sh --commit 8f897d2d23a338f7a062ebc4fa7aedc287d087de --non-interactive
       - name: Plugin Doctor
         run: hermes plugins doctor . --ci
       - name: Plugin validation
@@ -68,9 +77,13 @@ jobs:
         run: wsl.exe --status
       - name: Run Linux host checks through WSL2
         shell: pwsh
+        # The installer is staged into the WSL filesystem first and executed
+        # from disk there, so no remote script is piped straight into a shell.
         run: |
           wsl.exe --install -d Ubuntu
           $path = $PWD.Path.Replace('\', '/')
           $drive = $path.Substring(0, 1).ToLower()
           $path = "/mnt/$drive" + $path.Substring(2)
-          wsl.exe bash -lc "cd '$path' && (which hermes || curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash) && hermes plugins doctor . --ci && hermes plugins validate ."
+          wsl.exe bash -lc "curl -fsSL -o /tmp/hermes-install.sh https://hermes-agent.nousresearch.com/install.sh"
+          wsl.exe bash -lc "bash /tmp/hermes-install.sh --commit 8f897d2d23a338f7a062ebc4fa7aedc287d087de --non-interactive"
+          wsl.exe bash -lc "cd '$path' && hermes plugins doctor . --ci && hermes plugins validate ."
