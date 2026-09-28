@@ -33,9 +33,9 @@ def main() -> int:
     env = {**os.environ, "HERMES_HOME": str(isolated_home)}
     install = run([hermes, "plugins", "install", args.repo, "--ref", args.ref, "--enable"], env)
     listing = run([hermes, "plugins", "list", "--plain", "--no-bundled"], env)
-    plugin_doctor = run([hermes, "plugins", "doctor", "hermes-sdd-team", "--ci"], env)
+    plugin_doctor = run([hermes, "plugins", "doctor", "hermes-sdd", "--ci"], env)
     listing_output = str(listing["stdout"])
-    enabled = any(line.startswith("enabled ") and "hermes-sdd-team" in line for line in listing_output.splitlines())
+    enabled = any(line.startswith("enabled ") and "hermes-sdd" in line for line in listing_output.splitlines())
     result = {"ok": all(item["exit_status"] == 0 for item in (install, listing, plugin_doctor)) and enabled, "enabled": enabled, "isolated_home": str(isolated_home), "repo": args.repo, "ref": args.ref, "checks": [install, listing, plugin_doctor]}
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["ok"] else 1

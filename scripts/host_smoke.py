@@ -26,7 +26,7 @@ def main() -> int:
         return 2
     with tempfile.TemporaryDirectory(prefix="hermes-sdd-release-") as directory:
         workspace = Path(directory)
-        artifact = workspace / "hermes-sdd-team.tar.gz"
+        artifact = workspace / "hermes-sdd.tar.gz"
         build(root, artifact)
         extracted = workspace / "plugin"
         extracted.mkdir()

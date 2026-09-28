@@ -65,7 +65,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
     root = args.root.resolve()
-    output = (args.output or root / "dist" / "hermes-sdd-team-0.1.0.tar.gz").resolve()
+    output = (args.output or root / "dist" / "hermes-sdd-0.1.0.tar.gz").resolve()
     print(json.dumps(build(root, output), indent=2, sort_keys=True))
     return 0
 

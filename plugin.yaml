@@ -1,7 +1,7 @@
-name: hermes-sdd-team
+name: hermes-sdd
 version: 0.1.0
 description: Verified local repository delivery through adaptive specifications, durable evidence, and Hermes Kanban workers.
-author: Hermes SDD Team
+author: Hermes SDD
 license: MIT
 tags:
   - software-development

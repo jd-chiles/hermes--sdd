@@ -54,7 +54,7 @@ class HermesBridge:
                     name=shlex.quote(name), description=shlex.quote(description)
                 )
             )
-            enable = self.terminal(f"hermes -p {shlex.quote(name)} plugins enable hermes-sdd-team")
+            enable = self.terminal(f"hermes -p {shlex.quote(name)} plugins enable hermes-sdd")
             results.append({"profile": name, "create": create, "enable": enable})
         return results
 

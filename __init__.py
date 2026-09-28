@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 _package_dir = Path(__file__).with_name("sdd_hermes")
-_package_name = "_hermes_sdd_team_impl"
+_package_name = "_hermes_sdd_impl"
 _spec = importlib.util.spec_from_file_location(
     _package_name,
     _package_dir / "__init__.py",

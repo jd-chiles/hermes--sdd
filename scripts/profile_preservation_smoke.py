@@ -42,7 +42,7 @@ def main() -> int:
     install = run([hermes, "plugins", "install", args.repo, "--ref", args.ref, "--enable"], env)
     preserved = top_level_soul.read_bytes() == before_top and profile_soul.read_bytes() == before_profile
     listing = run([hermes, "plugins", "list", "--plain", "--no-bundled"], env)
-    enabled = any(line.startswith("enabled ") and "hermes-sdd-team" in line for line in str(listing["stdout"]).splitlines())
+    enabled = any(line.startswith("enabled ") and "hermes-sdd" in line for line in str(listing["stdout"]).splitlines())
     result = {"ok": install["exit_status"] == 0 and listing["exit_status"] == 0 and enabled and preserved, "enabled": enabled, "preserved": preserved, "isolated_home": str(home), "checks": [install, listing]}
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["ok"] else 1

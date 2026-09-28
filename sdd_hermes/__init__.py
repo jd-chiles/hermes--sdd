@@ -1,4 +1,4 @@
-"""Hermes SDD Team native plugin.
+"""Hermes SDD native plugin.
 
 The plugin keeps the deterministic workflow kernel local and delegates worker
 processes, board history, approvals, and terminal execution to Hermes through its
@@ -190,7 +190,7 @@ class SDDService:
 
     def doctor(self) -> dict[str, Any]:
         status = self.ledger.status()
-        return {"plugin": "hermes-sdd-team", "root": str(self.root), "initialized": status["initialized"], "ledger": str(self.paths.database), "ledger_schema": SCHEMA_VERSION, "native_dispatch": self.bridge.available(), "limits": DEFAULT_LIMITS, "notes": ["Hermes owns worker processes, approvals, and Kanban persistence.", "The SDD ownership ledger is coordination metadata, not an OS security sandbox.", "Profiles and managed dependency adapters must be exercised against the target Hermes release before publication."]}
+        return {"plugin": "hermes-sdd", "root": str(self.root), "initialized": status["initialized"], "ledger": str(self.paths.database), "ledger_schema": SCHEMA_VERSION, "native_dispatch": self.bridge.available(), "limits": DEFAULT_LIMITS, "notes": ["Hermes owns worker processes, approvals, and Kanban persistence.", "The SDD ownership ledger is coordination metadata, not an OS security sandbox.", "Profiles and managed dependency adapters must be exercised against the target Hermes release before publication."]}
 
     def pause(self) -> dict[str, Any]:
         project = self.ledger.project()

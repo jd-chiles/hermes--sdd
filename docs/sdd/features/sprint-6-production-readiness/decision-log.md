@@ -26,9 +26,9 @@ Completion converts commitments to actual consumption; it does not refund consum
 
 Required checks belong to the spec, not the implementation's self-reported list. Require complete diff coverage and explicit independent review because passing a command does not prove a natural-language outcome. Permit a separately reported no-change-needed result only with behavior evidence and justification. Initially use Git baselines for diff certification; other repository types remain explicitly unsupported until an equivalent adapter is tested.
 
-## D-07 — Preserve the installed plugin identifier
+## D-07 — Standardize the installed plugin identifier
 
-Use `jd-chiles/hermes--spec-driven-development-plugin` as the canonical repository in new documentation, while retaining `hermes-sdd-team` as the installed identifier unless a tested migration justifies a rename. Align public copy, tool schemas, help, and release metadata. Select the actual candidate version/ref during S6-12; this spec does not create a release.
+Use `jd-chiles/hermes--spec-driven-development-plugin` as the canonical repository and `hermes-sdd` as the installed identifier. Align public copy, tool schemas, help, and release metadata. Select the actual candidate version/ref during S6-12; this spec does not create a release.
 
 ## D-08 — Public diagnostics are read-only
 

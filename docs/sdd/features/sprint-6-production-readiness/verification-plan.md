@@ -42,7 +42,7 @@ Capability outcomes are `verified`, `unsupported`, or `unverified`, with support
 Build a candidate from the exact revision using the packaging script:
 
 ```bash
-python3 scripts/package_release.py --output artifact/hermes-sdd-team.tar.gz
+python3 scripts/package_release.py --output artifact/hermes-sdd.tar.gz
 python3 scripts/host_smoke.py
 ```
 
