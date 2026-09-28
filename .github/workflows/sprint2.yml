@@ -24,10 +24,10 @@ jobs:
           python -m compileall -q sdd_hermes scripts
           python -m unittest discover -s tests -v
       - name: Build release artifact
-        run: python scripts/package_release.py --output artifact/hermes-sdd-team.tar.gz
+        run: python scripts/package_release.py --output artifact/hermes-sdd.tar.gz
       - name: Check artifact manifest
         shell: bash
-        run: test -s artifact/hermes-sdd-team.tar.gz && test -s artifact/hermes-sdd-team.tar.gz.json
+        run: test -s artifact/hermes-sdd.tar.gz && test -s artifact/hermes-sdd.tar.gz.json
 
   hermes-linux:
     name: Hermes host contract (Linux)

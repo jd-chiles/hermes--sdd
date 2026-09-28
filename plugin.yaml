@@ -19,3 +19,7 @@ provides_tools:
   - sdd_pause
   - sdd_resume
   - sdd_recover
+  - sdd_admit_recovery
+  - sdd_recover_task
+  - sdd_complete_task
+  - sdd_close
