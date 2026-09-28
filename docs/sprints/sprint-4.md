@@ -35,7 +35,8 @@ Complete the local recovery state machine so provider failures cannot trigger bl
 - Local suite: 49 tests passed; Python compilation and diff checks passed.
 - Pinned Hermes source contract: passed at `8f897d2d23a338f7a062ebc4fa7aedc287d087de`; confirms `--idempotency-key`, `--max-retries`, and provider/model worker propagation without launching a worker.
 - Artifact smoke: attempted and blocked because the installed Hermes runtime cannot acquire its read-only `.install.lock`/`pm-runtime/.prepare.lock`. Plugin Doctor and validation did not execute.
-- Clean-install, profile-preservation, and WSL2 checks require the pushed immutable Sprint 4 revision and a writable Hermes runtime.
+- Clean-install and profile-preservation were attempted against immutable revision `16066ad5f311d3f4d9908285d610e68e79ea8735`; both were blocked while Hermes tried to download its runtime because DNS is unavailable, leaving `ruamel` unavailable in the incomplete host environment. Profile sentinels remained preserved.
+- WSL2 validation is defined in `.github/workflows/sprint2.yml` but cannot execute from this Linux workspace; it remains a CI-host gate.
 
 ## Exit criteria
 
