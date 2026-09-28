@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .difficulty import assess
 from .core import Ledger, ProjectPaths, SDDError, slugify
 
 
@@ -40,7 +41,7 @@ def _criteria(request: str) -> list[dict[str, Any]]:
     return [{"id": f"AC-{index:03d}", "text": statement, "required": True} for index, statement in enumerate(statements, start=1)]
 
 
-def build_plan(request: str, explicit_mode: str | None = None) -> Plan:
+def build_plan(request: str, explicit_mode: str | None = None, task_assessments: dict[str, dict[str, Any]] | None = None) -> Plan:
     request = request.strip()
     if not request:
         raise SDDError("a non-empty development request is required")
@@ -70,12 +71,21 @@ def build_plan(request: str, explicit_mode: str | None = None) -> Plan:
             ("T-006", "Run acceptance and browser scenarios", "qa", "acceptance", "T-005"),
             ("T-007", "Prepare requested documentation and launch materials", "writer", "documentation", "T-006"),
         ]
+    task_assessments = task_assessments or {}
+    if set(task_assessments) - {item[0] for item in task_templates}:
+        raise SDDError("assessment references an unknown task key")
+    difficulties = {}
+    for key, *_ in task_templates:
+        assessment = task_assessments.get(key, {})
+        if not isinstance(assessment, dict) or set(assessment) - {"dimensions", "rationale", "override"}:
+            raise SDDError("invalid task assessment fields")
+        difficulties[key] = assess(**assessment)
     return Plan(
         mode=mode,
         slug=slug,
         objective=request,
         criteria=_criteria(request),
-        tasks=[{"stable_key": key, "title": title, "role": role, "kind": kind, "parent_key": parent} for key, title, role, kind, parent in task_templates],
+        tasks=[{"stable_key": key, "title": title, "role": role, "kind": kind, "parent_key": parent, "difficulty": difficulties[key], "parent_keys": (["T-002", "T-003"] if mode == "product" and key == "T-004" else [parent] if parent else [])} for key, title, role, kind, parent in task_templates],
     )
 
 
@@ -100,8 +110,9 @@ def write_spec(paths: ProjectPaths, plan: Plan, ledger: Ledger) -> Path:
     lines.extend(f"- **{criterion['id']}** — {criterion['text']}" for criterion in plan.criteria)
     lines.extend(["", "## Stable task graph", ""])
     for task in plan.tasks:
-        dependency = f"; depends on `{task['parent_key']}`" if task.get("parent_key") else ""
-        lines.append(f"- **{task['stable_key']}** ({task['role']}) — {task['title']}{dependency}")
+        dependency = "; depends on " + ", ".join(f"`{key}`" for key in task.get("parent_keys", [])) if task.get("parent_keys") else ""
+        lines.append(f"- **{task['stable_key']}** ({task['role']}; difficulty: {task['difficulty']['tier']}) — {task['title']}{dependency}")
+        lines.append(f"  - Assessment: {task['difficulty']['rationale']}")
     lines.extend(["", "## Limits", "", "- Maximum concurrent workers: 3", "- Maximum repair cycles per task: 2", "- Maximum run duration: 60 minutes", ""])
     spec_path.write_text("\n".join(lines), encoding="utf-8")
     return spec_path

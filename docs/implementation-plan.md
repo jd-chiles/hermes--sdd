@@ -12,7 +12,11 @@
 8. Native Hermes bridge that uses `ctx.dispatch_tool("terminal", ...)` and explicit `--board` arguments; it never writes Hermes' database.
 9. Pause, resume, status, and doctor surfaces with visible limits and blockers.
 
-## Next release gates
+## Current sprint
+
+[Sprint 3](sprints/sprint-3.md) prioritizes acceptance correctness, dispatch recovery, atomic admission, reproducible packaging, and [difficulty tiers with executable escalation](design/task-tiers-and-escalation.md). Tier routing and escalation are specified but not yet implemented. See the [project review](reviews/sprint-3-review.md) for known gaps in the delivered contracts.
+
+## Release and follow-up gates (see Sprint 2 for collected evidence)
 
 - Exercise actual plugin installation and `hermes plugins doctor` against the minimum supported Hermes revision.
 - Replace the profile recipe placeholder with the host's supported profile provisioning API and test existing-profile preservation.

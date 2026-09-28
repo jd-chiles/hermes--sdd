@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_LIMITS = {"max_workers": 3, "max_repairs": 2, "max_runtime_seconds": 3600}
 
 
@@ -169,6 +169,14 @@ class Ledger:
                     checks_json TEXT NOT NULL, summary TEXT NOT NULL, state TEXT NOT NULL,
                     created_at INTEGER NOT NULL, UNIQUE(task_id, attempt_no)
                 );
+                CREATE TABLE IF NOT EXISTS attempt_context (
+                    attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+                    engineer_ids_json TEXT NOT NULL, content_fingerprint TEXT NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS context_immutable_update
+                    BEFORE UPDATE ON attempt_context BEGIN SELECT RAISE(ABORT, 'attempt context is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS context_immutable_delete
+                    BEFORE DELETE ON attempt_context BEGIN SELECT RAISE(ABORT, 'attempt context is immutable'); END;
                 CREATE TABLE IF NOT EXISTS evidence (
                     evidence_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
                     criterion_id TEXT NOT NULL, kind TEXT NOT NULL, command TEXT NOT NULL,
@@ -194,7 +202,10 @@ class Ledger:
                     BEFORE DELETE ON evidence BEGIN SELECT RAISE(ABORT, 'evidence is immutable'); END;
                 """
             )
-            db.execute("INSERT OR IGNORE INTO metadata(key, value) VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
+            version = db.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()
+            if version and int(version[0]) > SCHEMA_VERSION:
+                raise SDDError("ledger was written by a newer plugin; upgrade before continuing")
+            db.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
 
     def append_event(self, project_id: str, event_type: str, payload: Mapping[str, Any], operation_id: str | None = None) -> bool:
         operation_id = operation_id or str(uuid.uuid4())
@@ -206,12 +217,8 @@ class Ledger:
                 )
             except sqlite3.IntegrityError:
                 return False
-        self._append_jsonl({"project_id": project_id, "operation_id": operation_id, "event_type": event_type, "payload": payload})
+        self.export_jsonl()
         return True
-
-    def _append_jsonl(self, event: Mapping[str, Any]) -> None:
-        with self.paths.jsonl.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"at": utc_now(), **event}, sort_keys=True) + "\n")
 
     def init_project(self, request: str, mode: str, slug: str, board_slug: str, criteria: list[dict[str, Any]], task_specs: list[dict[str, Any]], limits: Mapping[str, int] | None = None) -> dict[str, Any]:
         root = str(self.paths.root)
@@ -223,9 +230,11 @@ class Ledger:
         with self._connect() as db:
             existing = db.execute("SELECT project_id FROM projects WHERE project_id = ?", (project_id,)).fetchone()
             if existing:
-                current = db.execute("SELECT request, mode FROM specs WHERE project_id = ? ORDER BY revision DESC LIMIT 1", (project_id,)).fetchone()
+                current = db.execute("SELECT request, mode, content_json FROM specs WHERE project_id = ? ORDER BY revision DESC LIMIT 1", (project_id,)).fetchone()
                 if current and (current["request"] != request or current["mode"] != mode):
                     raise SDDError("repository already has a different active SDD request; finish or recover it before starting another project")
+                if current and current["content_json"] != json_text(spec_content):
+                    raise SDDError("existing specification differs; explicit revision required before changing task policy")
                 already_initialized = True
             else:
                 db.execute(
@@ -297,19 +306,32 @@ class Ledger:
         if not task:
             raise SDDError(f"unknown task: {task_id}")
         project_id = task["project_id"]
-        normalized = [safe_relative(self.paths.root, item) for item in files]
+        normalized = sorted({safe_relative(self.paths.root, item) for item in files})
+        payload = {"task_id": task_id, "owner": owner, "files": normalized}
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            previous = db.execute("SELECT project_id, event_type, payload_json FROM events WHERE operation_id = ?", (operation_id,)).fetchone()
+            if previous:
+                if previous["project_id"] != project_id or previous["event_type"] != "ownership_acquired" or previous["payload_json"] != json_text(payload):
+                    raise SDDError("operation ID was already used with different inputs")
+                return normalized
+            project = db.execute("SELECT paused FROM projects WHERE project_id = ?", (project_id,)).fetchone()
+            if project["paused"]:
+                raise SDDError("project is paused")
+            existing = db.execute("SELECT path, task_id, owner FROM ownership WHERE project_id = ?", (project_id,)).fetchall()
             for path in normalized:
-                existing = db.execute("SELECT task_id, owner FROM ownership WHERE project_id = ? AND path = ?", (project_id, path)).fetchone()
-                if existing and existing["task_id"] != task_id:
-                    raise SDDError(f"file ownership conflict for {path}: held by {existing['task_id']} ({existing['owner']})")
+                for held in existing:
+                    if held["task_id"] != task_id and (path == held["path"] or path.startswith(held["path"] + "/") or held["path"].startswith(path + "/")):
+                        raise SDDError(f"file ownership conflict for {path}: held by {held['task_id']} ({held['owner']})")
             now = utc_now()
             for path in normalized:
                 db.execute(
                     "INSERT OR REPLACE INTO ownership(project_id, path, task_id, owner, operation_id, acquired_at) VALUES(?,?,?,?,?,?)",
                     (project_id, path, task_id, owner, operation_id, now),
                 )
-        self.append_event(project_id, "ownership_acquired", {"task_id": task_id, "owner": owner, "files": normalized}, operation_id)
+            db.execute("INSERT INTO events VALUES(?,?,?,?,?,?)", (str(uuid.uuid4()), project_id, operation_id, "ownership_acquired", json_text(payload), now))
+            db.execute("UPDATE tasks SET status = 'running', updated_at = ? WHERE task_id = ?", (now, task_id))
+        self.export_jsonl()
         return normalized
 
     def release_ownership(self, task_id: str) -> None:
@@ -319,21 +341,63 @@ class Ledger:
         with self._connect() as db:
             db.execute("DELETE FROM ownership WHERE project_id = ? AND task_id = ?", (task["project_id"], task_id))
 
+    @staticmethod
+    def _current_attempts(db, project_id: str) -> list[dict[str, Any]]:
+        return [dict(row) for row in db.execute(
+            "SELECT a.* FROM attempts a JOIN tasks t ON t.task_id = a.task_id "
+            "WHERE t.project_id = ? AND a.attempt_no = "
+            "(SELECT MAX(b.attempt_no) FROM attempts b WHERE b.task_id = a.task_id) "
+            "ORDER BY a.task_id", (project_id,))]
+
     def create_attempt(self, task_id: str, actor: str, role: str, spec_revision: int, changed_files: Sequence[str], checks: Sequence[str], summary: str, state: str = "submitted", attempt_id: str | None = None) -> dict[str, Any]:
-        task = self.task(task_id)
-        if not task:
-            raise SDDError(f"unknown task: {task_id}")
-        if spec_revision != task["spec_revision"]:
-            raise SDDError(f"stale specification revision {spec_revision}; current is {task['spec_revision']}")
         attempt_id = attempt_id or str(uuid.uuid4())
+        normalized = sorted({safe_relative(self.paths.root, path) for path in changed_files})
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            task = db.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+            if not task:
+                raise SDDError(f"unknown task: {task_id}")
+            revision = db.execute("SELECT MAX(revision) FROM specs WHERE project_id = ?", (task["project_id"],)).fetchone()[0]
+            if spec_revision != revision or spec_revision != task["spec_revision"]:
+                raise SDDError(f"stale specification revision {spec_revision}; current is {revision}")
+            if role != task["role"]:
+                raise SDDError("submission role does not match task")
+            current = self._current_attempts(db, task["project_id"])
+            engineers = sorted(a["attempt_id"] for a in current if a["role"] == "engineer")
             attempt_no = db.execute("SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM attempts WHERE task_id = ?", (task_id,)).fetchone()[0]
             db.execute(
                 "INSERT INTO attempts(attempt_id, task_id, attempt_no, actor, role, spec_revision, changed_files_json, checks_json, summary, state, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (attempt_id, task_id, attempt_no, actor, role, spec_revision, json_text(list(changed_files)), json_text(list(checks)), summary, state, utc_now()),
+                (attempt_id, task_id, attempt_no, actor, role, spec_revision, json_text(normalized), json_text(list(checks)), summary, state, utc_now()),
             )
-        self.set_task_status(task_id, "review" if role == "engineer" else ("accepted" if state == "accepted" else "submitted"))
+            db.execute("INSERT INTO attempt_context VALUES(?,?,?)", (attempt_id, json_text(engineers), file_fingerprint(self.paths.root, normalized)))
+            db.execute("UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?", ("review" if role == "engineer" else "submitted", utc_now(), task_id))
+            db.execute("UPDATE projects SET stage = CASE WHEN paused = 1 THEN 'paused' ELSE 'review' END, updated_at = ? WHERE project_id = ?", (utc_now(), task["project_id"]))
         return {"attempt_id": attempt_id, "attempt_no": attempt_no, "task_id": task_id}
+
+    def verification_scope(self, attempt_id: str, criterion_id: str, changed_files: Sequence[str]) -> list[str]:
+        with self._connect() as db:
+            attempt = db.execute("SELECT a.*, t.project_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE attempt_id = ?", (attempt_id,)).fetchone()
+            if not attempt:
+                raise SDDError(f"unknown attempt: {attempt_id}")
+            current = self._current_attempts(db, attempt["project_id"])
+            if attempt_id not in {a["attempt_id"] for a in current}:
+                raise SDDError("cannot verify a superseded attempt")
+            spec = db.execute("SELECT revision, content_json FROM specs WHERE project_id = ? ORDER BY revision DESC LIMIT 1", (attempt["project_id"],)).fetchone()
+            if attempt["spec_revision"] != spec["revision"]:
+                raise SDDError("cannot verify an obsolete specification")
+            if criterion_id not in {c["id"] for c in json.loads(spec["content_json"])["criteria"]}:
+                raise SDDError(f"unknown criterion: {criterion_id}")
+            context = db.execute("SELECT * FROM attempt_context WHERE attempt_id = ?", (attempt_id,)).fetchone()
+            engineers = sorted(a["attempt_id"] for a in current if a["role"] == "engineer")
+            if not context or (attempt["role"] != "engineer" and json.loads(context["engineer_ids_json"]) != engineers):
+                raise SDDError("attempt is not bound to the current implementation; resubmit")
+        scope = json.loads(attempt["changed_files_json"])
+        supplied = sorted({safe_relative(self.paths.root, path) for path in changed_files})
+        if supplied != scope:
+            raise SDDError("verification file scope must match the submitted attempt")
+        if context["content_fingerprint"] != file_fingerprint(self.paths.root, scope):
+            raise SDDError("submitted files changed; submit a new attempt before verification")
+        return scope
 
     def add_evidence(self, attempt_id: str, criterion_id: str, kind: str, command: str, cwd: str, exit_status: int, output: str, content_fingerprint: str) -> str:
         with self._connect() as db:
@@ -347,73 +411,79 @@ class Ledger:
         return evidence_id
 
     def accept(self, task_id: str, required_criteria: Sequence[Mapping[str, Any]], root: Path) -> dict[str, Any]:
-        task = self.task(task_id)
-        if not task:
+        if not self.task(task_id):
             raise SDDError(f"unknown task: {task_id}")
-        with self._connect() as db:
-            attempts = [dict(row) for row in db.execute("SELECT * FROM attempts WHERE task_id = ? ORDER BY attempt_no", (task_id,))]
-            evidence = [dict(row) for row in db.execute("SELECT e.* FROM evidence e JOIN attempts a ON a.attempt_id = e.attempt_id WHERE a.task_id = ?", (task_id,))]
-        current = {item["criterion_id"] if "criterion_id" in item else item["id"]: item for item in required_criteria if item.get("required", True)}
-        reasons: list[str] = []
-        latest_by_criterion: dict[str, dict[str, Any]] = {}
-        for item in evidence:
-            latest_by_criterion[item["criterion_id"]] = item
-        for criterion_id in current:
-            item = latest_by_criterion.get(criterion_id)
-            if not item:
-                reasons.append(f"missing evidence for {criterion_id}")
-                continue
-            if item["exit_status"] != 0:
-                reasons.append(f"verification failed for {criterion_id} (exit {item['exit_status']})")
-            if item["content_fingerprint"] != file_fingerprint(root, json.loads(next(a for a in attempts if a["attempt_id"] == item["attempt_id"])["changed_files_json"])):
-                reasons.append(f"evidence is stale for {criterion_id}; changed files no longer match")
-        if not any(a["role"] == "reviewer" and a["state"] in ("accepted", "submitted") for a in attempts):
-            reasons.append("independent reviewer submission is missing")
-        accepted = not reasons
-        if accepted:
+        # Task acceptance must not bypass the project-wide engineer/reviewer contract.
+        result = self.accept_project(required_criteria, root)
+        if result["accepted"]:
             self.set_task_status(task_id, "accepted")
-        return {"accepted": accepted, "task_id": task_id, "reasons": reasons, "criteria": sorted(current), "evidence_count": len(evidence)}
+        return {**result, "task_id": task_id}
 
     def accept_project(self, required_criteria: Sequence[Mapping[str, Any]], root: Path) -> dict[str, Any]:
-        """Evaluate the whole project, independent of native board card state."""
         project_id = self.project_id()
         if not project_id:
             raise SDDError("project is not initialized")
         with self._connect() as db:
-            attempts = [dict(row) for row in db.execute(
-                "SELECT a.*, t.role AS task_role FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.project_id = ? ORDER BY a.attempt_no",
-                (project_id,),
-            )]
+            db.execute("BEGIN IMMEDIATE")
+            spec = db.execute("SELECT revision, content_json FROM specs WHERE project_id = ? ORDER BY revision DESC LIMIT 1", (project_id,)).fetchone()
+            # The stored specification is authoritative; callers cannot omit criteria.
+            required = {c["id"] for c in json.loads(spec["content_json"])["criteria"] if c.get("required", True)}
+            attempts = self._current_attempts(db, project_id)
+            contexts = {row["attempt_id"]: dict(row) for row in db.execute("SELECT * FROM attempt_context")}
+            engineers = [a for a in attempts if a["role"] == "engineer"]
+            engineer_ids = sorted(a["attempt_id"] for a in engineers)
+            engineer_actors = {a["actor"] for a in engineers}
+            engineer_files = {path for a in engineers for path in json.loads(a["changed_files_json"])}
+            reasons: list[str] = []
+            for task in db.execute("SELECT task_id FROM tasks WHERE project_id = ? AND role = 'engineer'", (project_id,)):
+                if task["task_id"] not in {a["task_id"] for a in engineers}:
+                    reasons.append("engineer submission is missing")
+            eligible = {}
+            for attempt in attempts:
+                context = contexts.get(attempt["attempt_id"])
+                if attempt["spec_revision"] != spec["revision"] or not context:
+                    reasons.append(f"attempt {attempt['attempt_id']} is obsolete or lacks submission context; resubmit")
+                    continue
+                if attempt["role"] != "engineer" and json.loads(context["engineer_ids_json"]) != engineer_ids:
+                    reasons.append(f"attempt {attempt['attempt_id']} targets a superseded implementation")
+                    continue
+                if context["content_fingerprint"] != file_fingerprint(root, json.loads(attempt["changed_files_json"])):
+                    reasons.append(f"submission is stale for {attempt['task_id']}; changed files no longer match")
+                    continue
+                if attempt["state"] not in {"submitted", "accepted"}:
+                    reasons.append(f"submission is not successful for {attempt['task_id']}")
+                    continue
+                eligible[attempt["attempt_id"]] = attempt
+            reviewers = [a for a in eligible.values() if a["role"] == "reviewer" and a["actor"] not in engineer_actors and engineer_files <= set(json.loads(a["changed_files_json"]))]
+            if not reviewers:
+                reasons.append("independent reviewer submission is missing")
             evidence = [dict(row) for row in db.execute(
-                "SELECT e.*, a.changed_files_json, a.spec_revision FROM evidence e JOIN attempts a ON a.attempt_id = e.attempt_id JOIN tasks t ON t.task_id = a.task_id WHERE t.project_id = ?",
-                (project_id,),
-            )]
-        required = {item.get("id", item.get("criterion_id")): item for item in required_criteria if item.get("required", True)}
-        reasons: list[str] = []
-        latest: dict[str, dict[str, Any]] = {}
-        for item in evidence:
-            latest[item["criterion_id"]] = item
-        for criterion_id in required:
-            item = latest.get(criterion_id)
-            if not item:
-                reasons.append(f"missing evidence for {criterion_id}")
-                continue
-            if item["exit_status"] != 0:
-                reasons.append(f"verification failed for {criterion_id} (exit {item['exit_status']})")
-            changed_files = json.loads(item["changed_files_json"])
-            if item["content_fingerprint"] != file_fingerprint(root, changed_files):
-                reasons.append(f"evidence is stale for {criterion_id}; changed files no longer match")
-            if item["spec_revision"] != 1:
-                reasons.append(f"evidence for {criterion_id} targets an obsolete specification")
-        if not any(item["role"] == "reviewer" and item["state"] in ("accepted", "submitted") for item in attempts):
-            reasons.append("independent reviewer submission is missing")
-        if not any(item["role"] == "engineer" for item in attempts):
-            reasons.append("engineer submission is missing")
-        accepted = not reasons
-        if accepted:
-            with self._connect() as db:
-                db.execute("UPDATE projects SET stage = 'accepted', updated_at = ? WHERE project_id = ?", (utc_now(), project_id))
-        return {"accepted": accepted, "project_id": project_id, "reasons": reasons, "criteria": sorted(required), "evidence_count": len(evidence)}
+                "SELECT e.* FROM evidence e JOIN attempts a ON a.attempt_id = e.attempt_id JOIN tasks t ON t.task_id = a.task_id WHERE t.project_id = ? ORDER BY e.rowid", (project_id,))]
+            latest = {}
+            for item in evidence:
+                if item["attempt_id"] in eligible:
+                    latest[(item["attempt_id"], item["criterion_id"], item["command"])] = item
+            covered = set()
+            passed_commands = set()
+            for item in latest.values():
+                attempt = eligible[item["attempt_id"]]
+                if item["exit_status"] != 0:
+                    reasons.append(f"verification failed for {item['criterion_id']} (exit {item['exit_status']})")
+                elif item["content_fingerprint"] != file_fingerprint(root, json.loads(attempt["changed_files_json"])):
+                    reasons.append(f"evidence is stale for {item['criterion_id']}")
+                else:
+                    covered.add(item["criterion_id"])
+                    passed_commands.add((item["attempt_id"], item["command"]))
+            reasons.extend(f"missing evidence for {c}" for c in sorted(required - covered))
+            for attempt in eligible.values():
+                for command in json.loads(attempt["checks_json"]):
+                    if (attempt["attempt_id"], command) not in passed_commands:
+                        reasons.append(f"missing passing required command for {attempt['task_id']}: {command}")
+            accepted = not reasons
+            db.execute("UPDATE projects SET stage = CASE WHEN paused = 1 THEN 'paused' ELSE ? END, updated_at = ? WHERE project_id = ?", ("accepted" if accepted else "review", utc_now(), project_id))
+            if not accepted:
+                db.execute("UPDATE tasks SET status = 'review' WHERE project_id = ? AND status = 'accepted'", (project_id,))
+        return {"accepted": accepted, "project_id": project_id, "reasons": reasons, "criteria": sorted(required), "evidence_count": len(latest)}
 
     def status(self) -> dict[str, Any]:
         project = self.project()
@@ -434,14 +504,27 @@ class Ledger:
             raise SDDError("project is not initialized")
         now = utc_now()
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             current = db.execute("SELECT holder, expires_at FROM leases WHERE project_id = ?", (project_id,)).fetchone()
             if current and current["expires_at"] > now and current["holder"] != holder:
                 return False
             db.execute("INSERT OR REPLACE INTO leases(project_id, holder, expires_at, acquired_at) VALUES(?,?,?,?)", (project_id, holder, now + ttl, now))
         return True
 
+    def release_lease(self, holder: str) -> None:
+        with self._connect() as db:
+            db.execute("DELETE FROM leases WHERE project_id = ? AND holder = ?", (self.project_id(), holder))
+
     def export_jsonl(self) -> Path:
-        # Events are written as part of each committed append.  Return the stable path for callers.
+        # Rebuild from the authoritative SQLite event log after interrupted exports.
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("SELECT * FROM events ORDER BY rowid").fetchall()
+            temporary = self.paths.jsonl.with_suffix(".jsonl.tmp")
+            with temporary.open("w", encoding="utf-8") as stream:
+                for row in rows:
+                    stream.write(json_text({"at": row["created_at"], "project_id": row["project_id"], "operation_id": row["operation_id"], "event_type": row["event_type"], "payload": json.loads(row["payload_json"])}) + "\n")
+            temporary.replace(self.paths.jsonl)
         return self.paths.jsonl
 
 
@@ -453,6 +536,7 @@ class VerificationRunner:
         self.root = root
 
     def run(self, attempt_id: str, criterion_id: str, command: str, changed_files: Sequence[str], timeout: int = 300) -> dict[str, Any]:
+        changed_files = self.ledger.verification_scope(attempt_id, criterion_id, changed_files)
         before = file_fingerprint(self.root, changed_files)
         argv = shlex.split(command)
         if not argv:
@@ -465,6 +549,12 @@ class VerificationRunner:
         except subprocess.TimeoutExpired as exc:
             status = 124
             output = f"timed out after {timeout}s\n{exc.stdout or ''}\n{exc.stderr or ''}".strip()
+        except OSError as exc:
+            status = 127
+            output = str(exc)
         fingerprint = file_fingerprint(self.root, changed_files)
+        if fingerprint != before:
+            status = status or 1
+            output += "\nVerification changed submitted files; resubmit before acceptance."
         evidence_id = self.ledger.add_evidence(attempt_id, criterion_id, "command", command, str(self.root), status, output, fingerprint)
         return {"evidence_id": evidence_id, "criterion_id": criterion_id, "exit_status": status, "duration_ms": int((time.monotonic() - started) * 1000), "output": output, "fingerprint_before": before, "fingerprint_after": fingerprint}

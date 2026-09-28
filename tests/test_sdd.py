@@ -1,4 +1,6 @@
 import tempfile
+import sys
+import shlex
 import unittest
 from pathlib import Path
 
@@ -36,9 +38,10 @@ class SDDTests(unittest.TestCase):
             engineer_service.initialize("Fix the app regression", "bugfix")
             engineer_task = next(t for t in engineer_service.ledger.tasks() if t["role"] == "engineer")["task_id"]
             reviewer_task = next(t for t in engineer_service.ledger.tasks() if t["role"] == "reviewer")["task_id"]
-            engineer_attempt = engineer_service.submit(engineer_task, 1, ["app.py"], ["python3 -m unittest"], "Fixed the regression")
-            engineer_service.verify(engineer_attempt["attempt_id"], "AC-001", "python3 -c 'assert True'", ["app.py"])
-            engineer_service.verify(engineer_attempt["attempt_id"], "AC-002", "python3 -c 'assert True'", ["app.py"])
+            command = shlex.join([sys.executable, "-c", "assert True"])
+            engineer_attempt = engineer_service.submit(engineer_task, 1, ["app.py"], [command], "Fixed the regression")
+            engineer_service.verify(engineer_attempt["attempt_id"], "AC-001", command, ["app.py"])
+            engineer_service.verify(engineer_attempt["attempt_id"], "AC-002", command, ["app.py"])
             before_review = engineer_service.accept()
             self.assertFalse(before_review["accepted"])
             self.assertIn("independent reviewer submission is missing", before_review["reasons"])

@@ -11,6 +11,8 @@ import json
 import shlex
 from typing import Any, Callable
 
+from .core import SDDError
+
 
 class HermesBridge:
     def __init__(self, dispatch: Callable[[str, dict[str, Any]], Any] | None = None):
@@ -59,7 +61,7 @@ class HermesBridge:
     def create_task(self, board_slug: str, title: str, body: str, assignee: str, parents: list[str] | None = None) -> dict[str, Any]:
         if not self.dispatch:
             return {"available": False}
-        command = f"hermes kanban --board {shlex.quote(board_slug)} create {shlex.quote(title)} --body {shlex.quote(body)} --assignee {shlex.quote(assignee)} --completion-contract local-only"
+        command = f"hermes kanban --board {shlex.quote(board_slug)} create {shlex.quote(title)} --body {shlex.quote(body)} --assignee {shlex.quote(assignee)} --completion-contract local-only --json"
         for parent in parents or []:
             command += f" --parent {shlex.quote(parent)}"
         raw = self.terminal(command)
@@ -69,25 +71,23 @@ class HermesBridge:
         """Find an already-created task during recovery using its stable body key."""
         if not self.dispatch:
             return None
-        raw = self.terminal(f"hermes kanban --board {shlex.quote(board_slug)} list --json")
-        if isinstance(raw, dict) and isinstance(raw.get("result"), (str, dict, list)):
-            raw = raw["result"]
-        candidates: list[Any] = []
-        if isinstance(raw, dict):
-            candidates = raw.get("tasks", raw.get("items", [])) if isinstance(raw.get("tasks", raw.get("items", [])), list) else []
-        elif isinstance(raw, str):
-            try:
-                decoded = json.loads(raw)
-                candidates = decoded if isinstance(decoded, list) else decoded.get("tasks", decoded.get("items", []))
-            except (json.JSONDecodeError, AttributeError):
-                return None
+        raw = self.decode_response(self.terminal(f"hermes kanban --board {shlex.quote(board_slug)} list --json"))
+        candidates = raw if isinstance(raw, list) else raw.get("tasks", raw.get("items")) if isinstance(raw, dict) else None
+        if not isinstance(candidates, list):
+            raise SDDError("invalid native task list; recovery cannot safely create tasks")
+        matches = []
         for candidate in candidates:
             if not isinstance(candidate, dict):
-                continue
-            body = str(candidate.get("body", ""))
-            if stable_key in body or candidate.get("stable_key") == stable_key:
-                return candidate.get("task_id") or candidate.get("id")
-        return None
+                raise SDDError("invalid native task entry")
+            markers = [line.strip() for line in str(candidate.get("body", "")).splitlines()]
+            if f"Stable task: {stable_key}" in markers or candidate.get("stable_key") == stable_key:
+                task_id = self.decode_task_id(candidate)
+                if not task_id:
+                    raise SDDError("matched native task has no ID")
+                matches.append(task_id)
+        if len(matches) > 1:
+            raise SDDError(f"ambiguous native tasks for {stable_key}; manual reconciliation required")
+        return matches[0] if matches else None
 
     def transition_task(self, board_slug: str, native_task_id: str, action: str, reason: str = "") -> Any:
         if action not in {"block", "unblock"}:
@@ -100,14 +100,33 @@ class HermesBridge:
         return self.terminal(command)
 
     @staticmethod
+    def decode_response(result: Any) -> Any:
+        for _ in range(8):
+            if isinstance(result, str):
+                try:
+                    result = json.loads(result)
+                except json.JSONDecodeError as exc:
+                    raise SDDError("native response is not valid JSON") from exc
+            elif isinstance(result, dict):
+                if result.get("error") or result.get("available") is False or result.get("ok") is False:
+                    raise SDDError("native operation failed or dispatch is unavailable")
+                if "exit_code" in result:
+                    if result["exit_code"] != 0:
+                        raise SDDError("native command failed or is still running; reconcile before retry")
+                    result = result.get("output", "")
+                elif "result" in result:
+                    result = result["result"]
+                else:
+                    return result
+            else:
+                return result
+        raise SDDError("native response envelope is too deeply nested")
+
+    @staticmethod
     def decode_task_id(result: Any) -> str | None:
+        result = HermesBridge.decode_response(result)
         if isinstance(result, dict):
-            return result.get("task_id") or result.get("id")
-        if isinstance(result, str):
-            try:
-                decoded = json.loads(result)
-                if isinstance(decoded, dict):
-                    return decoded.get("task_id") or decoded.get("id")
-            except json.JSONDecodeError:
-                return None
+            task_id = result.get("task_id") or result.get("id")
+            if isinstance(task_id, (str, int)) and not isinstance(task_id, bool):
+                return str(task_id)
         return None

@@ -10,7 +10,7 @@ Use a released immutable revision when publishing:
 hermes plugins install <owner>/hermes-sdd-team --ref <release-sha> --enable
 ```
 
-The package is a native Hermes plugin (`plugin.yaml` + `register(ctx)`). It does not require a copied prompt, manual profile configuration, separate MCP server, or provider account. It inherits the initiating profile's model configuration. The current repository is an implementation slice and still requires host compatibility verification against the target Hermes release before public publication.
+The package is a native Hermes plugin (`plugin.yaml` + `register(ctx)`). It does not require a copied prompt, manual profile configuration, separate MCP server, or provider account. Execution currently uses assigned role profiles; their effective model configuration is not yet verified by the plugin. The current repository is an implementation slice and still requires host compatibility verification against the target Hermes release before public publication.
 
 ## Commands
 
@@ -46,11 +46,13 @@ No automatic commits, pull requests, deployment, publication, or launch communic
 ## Development
 
 ```bash
-python -m pytest -q
-python -m compileall -q sdd_hermes
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q sdd_hermes scripts
 ```
 
-Sprint 2 release checks build and inspect the real artifact:
+Sprint 3 is underway: see the [prioritized review](docs/reviews/sprint-3-review.md) and [sprint backlog](docs/sprints/sprint-3.md).
+
+Release checks build and inspect the real artifact:
 
 ```bash
 python3 scripts/host_smoke.py
@@ -65,3 +67,9 @@ python3 scripts/profile_preservation_smoke.py \
 The smoke test extracts a tarball into a temporary directory and runs Hermes Plugin Doctor and validation there, so success does not depend on importing the source checkout.
 
 The `skills/` directory contains focused role guidance. Hermes loads only the skills registered by the plugin and can add them to task cards through its native Kanban mechanisms.
+
+Release archives include explicit source directories and exclude local workspace metadata and prior build outputs. Tar metadata and gzip headers are normalized for repeatable hashes; source symlinks are rejected. Scripts in the archive are invoked with Python.
+
+Task difficulty is assessed separately from bugfix/feature/product workflow selection. `sdd_initialize` accepts `task_assessments` keyed by stable task ID (for example, `T-001`), with `dimensions` (`scope`, `uncertainty`, `coupling`, `consequence`, `verification`) rated `low`, `med`, or `high`, plus a `rationale`. Unknown dimensions default to `med`; the highest risk determines the tier. Status reports routing as unverified until effective routes are integrated. Automatic model escalation is not implemented yet.
+
+Schema v2 binds submissions to file fingerprints and the current engineer attempts. Existing attempts without that context must be resubmitted and verified before acceptance. Reviewers must use a different actor identity and cover the engineer's submitted files. Verification file lists must match the submission, and every declared check must have passing evidence.

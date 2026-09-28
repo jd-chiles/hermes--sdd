@@ -10,11 +10,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
 from .bridge import HermesBridge
-from .core import DEFAULT_LIMITS, Ledger, ProjectPaths, SDDError, VerificationRunner, repository_fingerprint
+from .core import SCHEMA_VERSION, DEFAULT_LIMITS, Ledger, ProjectPaths, SDDError, VerificationRunner, repository_fingerprint
 from .planning import Plan, build_plan, read_current_plan, write_spec
 
 
@@ -33,13 +34,15 @@ class SDDService:
         self.bridge = bridge or HermesBridge()
         self.actor = actor
 
-    def initialize(self, request: str, mode: str | None = None, execute: bool = False, limits: dict[str, int] | None = None) -> dict[str, Any]:
-        plan = build_plan(request, mode)
+    def initialize(self, request: str, mode: str | None = None, execute: bool = False, limits: dict[str, int] | None = None, task_assessments: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+        plan = build_plan(request, mode, task_assessments)
         board_slug = f"sdd-{plan.slug}"
         initial_fingerprint = repository_fingerprint(self.root)
         project = self.ledger.init_project(request, plan.mode, plan.slug, board_slug, plan.criteria, plan.tasks, limits)
         spec_path = write_spec(self.paths, plan, self.ledger)
         self.ledger.append_event(project["project_id"], "initial_repository_snapshot", {"fingerprint": initial_fingerprint}, f"{project['project_id']}:initial-repository-snapshot")
+        if execute and not self.bridge.available():
+            raise SDDError("plan saved; Hermes dispatch context is unavailable")
         if execute:
             self.ledger.set_stage("dispatching")
             board = self.sync_board(plan, board_slug)
@@ -54,6 +57,8 @@ class SDDService:
             project = self.ledger.project() or {}
             plan = Plan(current["mode"], project.get("board_slug", "sdd-project"), current["request"], current["criteria"], current["tasks"])
         board_slug = board_slug or (self.ledger.project() or {})["board_slug"]
+        if (self.ledger.project() or {}).get("paused"):
+            raise SDDError("project is paused")
         profiles = {
             task["role"]: f"Hermes SDD {task['role']} for repository planning, implementation, review, or acceptance"
             for task in plan.tasks
@@ -67,7 +72,11 @@ class SDDService:
             if task_row["native_task_id"]:
                 native[task["stable_key"]] = task_row["native_task_id"]
                 continue
-            parents = [native[task["parent_key"]]] if task.get("parent_key") in native else []
+            parent_keys = task.get("parent_keys", [task["parent_key"]] if task.get("parent_key") else [])
+            missing = [key for key in parent_keys if key not in native]
+            if missing:
+                raise SDDError(f"cannot dispatch {task['stable_key']}: missing native parents {missing}")
+            parents = [native[key] for key in parent_keys]
             recovered_native_id = self.bridge.find_task(board_slug, task["stable_key"])
             if recovered_native_id:
                 self.ledger.set_native_task_id(task_row["task_id"], recovered_native_id)
@@ -77,6 +86,8 @@ class SDDService:
             body = f"SDD project: {plan.slug}\nStable task: {task['stable_key']}\nRole: {task['role']}\nAcceptance criteria: {', '.join(c['id'] for c in plan.criteria)}\nDo not claim completion without submitting evidence through the SDD tools."
             result = self.bridge.create_task(board_slug, task["title"], body, task["role"], parents)
             native_id = self.bridge.decode_task_id(result.get("result") if isinstance(result, dict) else result)
+            if not native_id:
+                raise SDDError(f"native creation returned no ID for {task['stable_key']}; reconcile before retry")
             if native_id:
                 self.ledger.set_native_task_id(task_row["task_id"], native_id)
                 native[task["stable_key"]] = native_id
@@ -84,11 +95,18 @@ class SDDService:
         return {"profiles": provisioned, "board": board, "created": created, "native_task_ids": native}
 
     def status(self) -> dict[str, Any]:
-        return self.ledger.status()
+        status = self.ledger.status()
+        if status["initialized"]:
+            plan = read_current_plan(self.ledger)
+            assessments = {task["stable_key"]: task.get("difficulty") for task in plan["tasks"]}
+            for task in status["tasks"]:
+                task["difficulty"] = assessments.get(task["stable_key"])
+            status["routing"] = {"state": "unverified", "escalation_available": False,
+                                 "reason": "Effective tier routes have not been verified; role profiles do not establish model escalation."}
+        return status
 
     def admit(self, task_id: str, files: list[str], operation_id: str) -> dict[str, Any]:
         owned = self.ledger.acquire_ownership(task_id, self.actor, files, operation_id)
-        self.ledger.set_task_status(task_id, "running")
         return {"task_id": task_id, "owner": self.actor, "files": owned, "operation_id": operation_id}
 
     def submit(self, task_id: str, spec_revision: int, changed_files: list[str], checks: list[str], summary: str, role: str | None = None, attempt_id: str | None = None) -> dict[str, Any]:
@@ -112,7 +130,7 @@ class SDDService:
 
     def doctor(self) -> dict[str, Any]:
         status = self.ledger.status()
-        return {"plugin": "hermes-sdd-team", "root": str(self.root), "initialized": status["initialized"], "ledger": str(self.paths.database), "ledger_schema": 1, "native_dispatch": self.bridge.available(), "limits": DEFAULT_LIMITS, "notes": ["Hermes owns worker processes, approvals, and Kanban persistence.", "The SDD ownership ledger is coordination metadata, not an OS security sandbox.", "Profiles and managed dependency adapters must be exercised against the target Hermes release before publication."]}
+        return {"plugin": "hermes-sdd-team", "root": str(self.root), "initialized": status["initialized"], "ledger": str(self.paths.database), "ledger_schema": SCHEMA_VERSION, "native_dispatch": self.bridge.available(), "limits": DEFAULT_LIMITS, "notes": ["Hermes owns worker processes, approvals, and Kanban persistence.", "The SDD ownership ledger is coordination metadata, not an OS security sandbox.", "Profiles and managed dependency adapters must be exercised against the target Hermes release before publication."]}
 
     def pause(self) -> dict[str, Any]:
         project = self.ledger.project()
@@ -133,16 +151,24 @@ class SDDService:
         return self.status()
 
     def recover(self) -> dict[str, Any]:
-        holder = f"recovery:{os.getpid()}"
-        if not self.ledger.acquire_lease(holder):
-            return {"recovered": False, "blocked": "another coordinator currently holds the project lease", "status": self.status()}
         current = self.ledger.status()
         if not current["initialized"]:
             return {"recovered": False, "blocked": "project is not initialized", "status": current}
-        self.ledger.set_stage("reconciling")
-        synced = self.sync_board()
-        self.ledger.set_stage("dispatching")
-        return {"recovered": True, "synced": synced, "status": self.status()}
+        if current["project"]["paused"]:
+            return {"recovered": False, "blocked": "project is paused", "status": current}
+        if not self.bridge.available():
+            return {"recovered": False, "blocked": "Hermes dispatch context is unavailable", "status": current}
+        holder = f"recovery:{uuid.uuid4()}"
+        if not self.ledger.acquire_lease(holder):
+            return {"recovered": False, "blocked": "another coordinator currently holds the project lease", "status": self.status()}
+        try:
+            self.ledger.export_jsonl()
+            self.ledger.set_stage("reconciling")
+            synced = self.sync_board()
+            self.ledger.set_stage("dispatching")
+            return {"recovered": True, "synced": synced, "status": self.status()}
+        finally:
+            self.ledger.release_lease(holder)
 
 
 def _root_from_params(params: dict[str, Any]) -> Path:
@@ -160,7 +186,7 @@ def _handle_tool(ctx: Any, name: str, params: dict[str, Any]) -> str:
     try:
         service = _service(ctx, params)
         if name == "initialize":
-            result = service.initialize(params["request"], params.get("mode"), bool(params.get("execute", False)), params.get("limits"))
+            result = service.initialize(params["request"], params.get("mode"), bool(params.get("execute", False)), params.get("limits"), params.get("task_assessments"))
         elif name == "status":
             result = service.status()
         elif name == "admit":
@@ -189,7 +215,7 @@ def _handle_tool(ctx: Any, name: str, params: dict[str, Any]) -> str:
 def _schemas() -> dict[str, dict[str, Any]]:
     root = {"type": "string", "description": "Repository root; defaults to Hermes' current working directory."}
     return {
-        "initialize": {"name": "sdd_initialize", "description": "Create or reconcile an SDD specification and stable task graph for a local repository request.", "parameters": {"type": "object", "properties": {"request": {"type": "string"}, "mode": {"type": "string", "enum": ["bugfix", "feature", "product"]}, "execute": {"type": "boolean"}, "project_root": root}, "required": ["request"]}},
+        "initialize": {"name": "sdd_initialize", "description": "Create or reconcile an SDD specification and stable task graph for a local repository request.", "parameters": {"type": "object", "properties": {"request": {"type": "string"}, "mode": {"type": "string", "enum": ["bugfix", "feature", "product"]}, "execute": {"type": "boolean"}, "task_assessments": {"type": "object", "description": "Per stable task key: dimensions (scope, uncertainty, coupling, consequence, verification) rated low/med/high, rationale, optional upward override."}, "project_root": root}, "required": ["request"]}},
         "status": {"name": "sdd_status", "description": "Show SDD stage, workers, task assignments, file ownership, checks, and blockers.", "parameters": {"type": "object", "properties": {"project_root": root}}},
         "admit": {"name": "sdd_admit_task", "description": "Atomically acquire explicit file ownership for an SDD task; overlapping ownership is rejected.", "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}, "files": {"type": "array", "items": {"type": "string"}}, "operation_id": {"type": "string"}, "project_root": root}, "required": ["task_id", "files"]}},
         "submit": {"name": "sdd_submit_result", "description": "Submit an immutable worker result for SDD evaluation. Completion is not acceptance.", "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}, "attempt_id": {"type": "string"}, "spec_revision": {"type": "integer"}, "changed_files": {"type": "array", "items": {"type": "string"}}, "checks": {"type": "array", "items": {"type": "string"}}, "summary": {"type": "string"}, "role": {"type": "string"}, "project_root": root}, "required": ["task_id", "spec_revision", "summary"]}},
@@ -213,7 +239,7 @@ def _slash(ctx: Any, raw_args: str) -> str:
     if command in {"plan", "build", "fix"}:
         if not rest:
             return _json({"ok": False, "error": f"Usage: /sdd {command} <request>"})
-        return _handle_tool(ctx, "initialize", {"request": rest, "mode": "bugfix" if command == "fix" else None, "execute": command == "build"})
+        return _handle_tool(ctx, "initialize", {"request": rest, "mode": "bugfix" if command == "fix" else None, "execute": command in {"build", "fix"}})
     # The bare form is the normal journey: classify, plan, and execute.
     return _handle_tool(ctx, "initialize", {"request": raw_args.strip(), "execute": True})
 
@@ -231,13 +257,13 @@ def _cli_setup(parser: argparse.ArgumentParser) -> None:
 
 
 def _cli_handler(args: argparse.Namespace) -> None:
-    root = Path(args.project_root or os.getcwd()).resolve()
-    command = args.sdd_command
+    root = Path(getattr(args, "project_root", None) or os.getcwd()).resolve()
+    command = args.sdd_command or "status"
     context = type("CLIContext", (), {})()
     if command in {"status", "doctor", "pause", "resume", "recover", "accept"}:
         result = _handle_tool(context, command, {"project_root": str(root)})
     else:
-        result = _handle_tool(context, "initialize", {"project_root": str(root), "request": args.request, "mode": "bugfix" if command == "fix" else None, "execute": command == "build"})
+        result = _handle_tool(context, "initialize", {"project_root": str(root), "request": args.request, "mode": "bugfix" if command == "fix" else None, "execute": command in {"build", "fix"}})
     print(result)
 
 
