@@ -2,6 +2,7 @@ import json
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -68,6 +69,26 @@ class CoordinationTests(unittest.TestCase):
         plan = build_plan('new product', 'product')
         self.assertEqual(plan.tasks[3]['parent_keys'], ['T-002', 'T-003'])
 
+    def test_dispatch_intent_is_idempotent_and_lease_can_be_renewed(self):
+        task = self.service.ledger.tasks()[0]
+        first = self.service.ledger.dispatch_intent(task['task_id'], task['stable_key'], 'dispatch-1', {'parents': []}, {'provider': 'p', 'model': 'm'})
+        second = self.service.ledger.dispatch_intent(task['task_id'], task['stable_key'], 'dispatch-1', {'parents': []}, {'provider': 'p', 'model': 'm'})
+        self.assertEqual(first['operation_id'], second['operation_id'])
+        self.assertFalse(first['replayed'])
+        self.assertTrue(second['replayed'])
+        with self.assertRaises(SDDError):
+            self.service.ledger.dispatch_intent(task['task_id'], task['stable_key'], 'dispatch-1', {'parents': ['changed']}, {'provider': 'p', 'model': 'm'})
+        self.assertTrue(self.service.ledger.acquire_lease('holder'))
+        self.assertTrue(self.service.ledger.renew_lease('holder'))
+        self.assertFalse(self.service.ledger.renew_lease('other'))
+
+    def test_failure_recovery_is_durable_and_does_not_change_task_tier(self):
+        task = self.service.ledger.tasks()[0]
+        result = self.service.record_failure(task['task_id'], '429', route_identity='provider/model@default')
+        self.assertEqual(result['failure']['class'], 'provider_transient')
+        self.assertEqual(result['decision']['state'], 'waiting_provider')
+        self.assertEqual(self.service.status()['recovery_events'][0]['failure_class'], 'provider_transient')
+
 
 class BridgeTests(unittest.TestCase):
     def test_terminal_envelope_and_numeric_task_id(self):
@@ -105,3 +126,7 @@ class BridgeTests(unittest.TestCase):
             with self.assertRaises(SDDError):
                 service.initialize('Fix regression', 'bugfix', execute=True)
             self.assertEqual(len(bridge.created), 1)
+
+    def test_effective_route_receipt_is_optional_and_explicit(self):
+        self.assertEqual(HermesBridge.effective_route({'effective_route': {'provider': 'p', 'model': 'm'}})['model'], 'm')
+        self.assertIsNone(HermesBridge.effective_route({'id': 'native-1'}))

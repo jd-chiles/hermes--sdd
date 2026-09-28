@@ -17,6 +17,7 @@ from typing import Any
 from .bridge import HermesBridge
 from .core import SCHEMA_VERSION, DEFAULT_LIMITS, Ledger, ProjectPaths, SDDError, VerificationRunner, repository_fingerprint
 from .planning import Plan, build_plan, read_current_plan, write_spec
+from .routing import classify_failure, recovery_decision, resolve_routes, route_from
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
@@ -67,6 +68,7 @@ class SDDService:
         board = self.bridge.ensure_board(board_slug, f"Hermes SDD — {plan.slug}")
         native: dict[str, str] = {}
         created: list[dict[str, Any]] = []
+        routing = self.routing()
         for task in plan.tasks:
             task_row = next(item for item in self.ledger.tasks() if item["stable_key"] == task["stable_key"])
             if task_row["native_task_id"]:
@@ -80,19 +82,37 @@ class SDDService:
             recovered_native_id = self.bridge.find_task(board_slug, task["stable_key"])
             if recovered_native_id:
                 self.ledger.set_native_task_id(task_row["task_id"], recovered_native_id)
+                operation_id = f"{self.ledger.project()['project_id']}:dispatch:{task['stable_key']}"
+                self.ledger.complete_dispatch(operation_id, recovered_native_id) if self.ledger.dispatches() and any(item["operation_id"] == operation_id for item in self.ledger.dispatches()) else None
                 native[task["stable_key"]] = recovered_native_id
                 created.append({"stable_key": task["stable_key"], "native_task_id": recovered_native_id, "recovered": True})
                 continue
             body = f"SDD project: {plan.slug}\nStable task: {task['stable_key']}\nRole: {task['role']}\nAcceptance criteria: {', '.join(c['id'] for c in plan.criteria)}\nDo not claim completion without submitting evidence through the SDD tools."
-            result = self.bridge.create_task(board_slug, task["title"], body, task["role"], parents)
+            route = routing.get("routes", {}).get(task.get("difficulty", {}).get("tier", "med"), {})
+            operation_id = f"{self.ledger.project()['project_id']}:dispatch:{task['stable_key']}"
+            intent = self.ledger.dispatch_intent(task_row["task_id"], task["stable_key"], operation_id, {"board": board_slug, "parents": parents, "assignee": task["role"]}, route)
+            if intent.get("replayed") and intent.get("state") == "pending":
+                raise SDDError(f"dispatch for {task['stable_key']} is unresolved; reconcile before retry")
+            result = self.bridge.create_task(board_slug, task["title"], body, task["role"], parents, route) if route else self.bridge.create_task(board_slug, task["title"], body, task["role"], parents)
             native_id = self.bridge.decode_task_id(result.get("result") if isinstance(result, dict) else result)
             if not native_id:
                 raise SDDError(f"native creation returned no ID for {task['stable_key']}; reconcile before retry")
             if native_id:
                 self.ledger.set_native_task_id(task_row["task_id"], native_id)
+                self.ledger.complete_dispatch(operation_id, native_id)
                 native[task["stable_key"]] = native_id
-            created.append({"stable_key": task["stable_key"], "native_task_id": native_id, "result": result})
-        return {"profiles": provisioned, "board": board, "created": created, "native_task_ids": native}
+            created.append({"stable_key": task["stable_key"], "native_task_id": native_id, "result": result, "effective_route": self.bridge.effective_route(result.get("result") if isinstance(result, dict) else result)})
+        return {"profiles": provisioned, "board": board, "created": created, "native_task_ids": native, "routing": routing}
+
+    def routing(self) -> dict[str, Any]:
+        raw = os.environ.get("HERMES_SDD_ROUTES_JSON")
+        if not raw:
+            return resolve_routes(None)
+        try:
+            config = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SDDError("HERMES_SDD_ROUTES_JSON is not valid JSON") from exc
+        return resolve_routes(config)
 
     def status(self) -> dict[str, Any]:
         status = self.ledger.status()
@@ -101,8 +121,10 @@ class SDDService:
             assessments = {task["stable_key"]: task.get("difficulty") for task in plan["tasks"]}
             for task in status["tasks"]:
                 task["difficulty"] = assessments.get(task["stable_key"])
-            status["routing"] = {"state": "unverified", "escalation_available": False,
-                                 "reason": "Effective tier routes have not been verified; role profiles do not establish model escalation."}
+            status["routing"] = self.routing()
+            status["routing"]["effective_host_routes"] = "unverified"
+            status["dispatches"] = self.ledger.dispatches()
+            status["recovery_events"] = self.ledger.recovery_events()
         return status
 
     def admit(self, task_id: str, files: list[str], operation_id: str) -> dict[str, Any]:
@@ -169,6 +191,11 @@ class SDDService:
             return {"recovered": True, "synced": synced, "status": self.status()}
         finally:
             self.ledger.release_lease(holder)
+
+    def record_failure(self, task_id: str, code: str, phase: str = "dispatch", route_identity: str = "unknown") -> dict[str, Any]:
+        failure = classify_failure(code, phase)
+        decision = recovery_decision(failure["class"], route_identity)
+        return self.ledger.record_recovery(task_id, failure, decision, route_identity)
 
 
 def _root_from_params(params: dict[str, Any]) -> Path:

@@ -58,14 +58,28 @@ class HermesBridge:
             results.append({"profile": name, "create": create, "enable": enable})
         return results
 
-    def create_task(self, board_slug: str, title: str, body: str, assignee: str, parents: list[str] | None = None) -> dict[str, Any]:
+    def create_task(self, board_slug: str, title: str, body: str, assignee: str, parents: list[str] | None = None, route: dict[str, Any] | None = None) -> dict[str, Any]:
         if not self.dispatch:
             return {"available": False}
         command = f"hermes kanban --board {shlex.quote(board_slug)} create {shlex.quote(title)} --body {shlex.quote(body)} --assignee {shlex.quote(assignee)} --completion-contract local-only --json"
         for parent in parents or []:
             command += f" --parent {shlex.quote(parent)}"
+        if route:
+            if route.get("provider"):
+                command += f" --provider {shlex.quote(str(route['provider']))}"
+            if route.get("model"):
+                command += f" --model {shlex.quote(str(route['model']))}"
         raw = self.terminal(command)
         return {"available": True, "result": raw}
+
+    @staticmethod
+    def effective_route(result: Any) -> dict[str, Any] | None:
+        """Extract a host receipt; absence is intentionally unverified."""
+        decoded = HermesBridge.decode_response(result)
+        if not isinstance(decoded, dict):
+            return None
+        route = decoded.get("effective_route") or decoded.get("route")
+        return dict(route) if isinstance(route, dict) else None
 
     def find_task(self, board_slug: str, stable_key: str) -> str | None:
         """Find an already-created task during recovery using its stable body key."""

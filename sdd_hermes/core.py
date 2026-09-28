@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_LIMITS = {"max_workers": 3, "max_repairs": 2, "max_runtime_seconds": 3600}
 
 
@@ -192,6 +192,18 @@ class Ledger:
                     project_id TEXT PRIMARY KEY REFERENCES projects(project_id), holder TEXT NOT NULL,
                     expires_at INTEGER NOT NULL, acquired_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS dispatches (
+                    operation_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(project_id),
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id), stable_key TEXT NOT NULL,
+                    payload_json TEXT NOT NULL, route_json TEXT NOT NULL, state TEXT NOT NULL,
+                    native_task_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS recovery_events (
+                    event_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(project_id),
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id), failure_class TEXT NOT NULL,
+                    phase TEXT NOT NULL, code TEXT NOT NULL, state TEXT NOT NULL,
+                    route_identity TEXT NOT NULL, decision_json TEXT NOT NULL, created_at INTEGER NOT NULL
+                );
                 CREATE TRIGGER IF NOT EXISTS attempts_immutable_update
                     BEFORE UPDATE ON attempts BEGIN SELECT RAISE(ABORT, 'attempts are immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS attempts_immutable_delete
@@ -300,6 +312,61 @@ class Ledger:
     def set_task_status(self, task_id: str, status: str) -> None:
         with self._connect() as db:
             db.execute("UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?", (status, utc_now(), task_id))
+
+    def dispatch_intent(self, task_id: str, stable_key: str, operation_id: str, payload: Mapping[str, Any], route: Mapping[str, Any]) -> dict[str, Any]:
+        task = self.task(task_id)
+        if not task:
+            raise SDDError(f"unknown task: {task_id}")
+        project_id = task["project_id"]
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute("SELECT * FROM dispatches WHERE operation_id = ?", (operation_id,)).fetchone()
+            encoded_payload, encoded_route = json_text(payload), json_text(route)
+            if existing:
+                if existing["project_id"] != project_id or existing["payload_json"] != encoded_payload or existing["route_json"] != encoded_route:
+                    raise SDDError("dispatch operation ID was already used with different inputs")
+                result = dict(existing)
+                result["replayed"] = True
+                return result
+            now = utc_now()
+            db.execute(
+                "INSERT INTO dispatches(operation_id, project_id, task_id, stable_key, payload_json, route_json, state, native_task_id, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (operation_id, project_id, task_id, stable_key, encoded_payload, encoded_route, "pending", None, now, now),
+            )
+            return {"operation_id": operation_id, "project_id": project_id, "task_id": task_id, "stable_key": stable_key, "state": "pending", "native_task_id": None, "replayed": False}
+
+    def complete_dispatch(self, operation_id: str, native_task_id: str) -> None:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM dispatches WHERE operation_id = ?", (operation_id,)).fetchone()
+            if not row:
+                raise SDDError("unknown dispatch operation")
+            db.execute("UPDATE dispatches SET state = 'completed', native_task_id = ?, updated_at = ? WHERE operation_id = ?", (native_task_id, utc_now(), operation_id))
+
+    def dispatches(self) -> list[dict[str, Any]]:
+        project_id = self.project_id()
+        if not project_id:
+            return []
+        with self._connect() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM dispatches WHERE project_id = ? ORDER BY created_at", (project_id,))]
+
+    def record_recovery(self, task_id: str, failure: Mapping[str, str], decision: Mapping[str, Any], route_identity: str) -> dict[str, Any]:
+        task = self.task(task_id)
+        if not task:
+            raise SDDError(f"unknown task: {task_id}")
+        event_id = str(uuid.uuid4())
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO recovery_events(event_id, project_id, task_id, failure_class, phase, code, state, route_identity, decision_json, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (event_id, task["project_id"], task_id, failure["class"], failure.get("phase", "dispatch"), failure.get("code", ""), decision["state"], route_identity, json_text(decision), utc_now()),
+            )
+        return {"event_id": event_id, "task_id": task_id, "failure": dict(failure), "decision": dict(decision), "route_identity": route_identity}
+
+    def recovery_events(self) -> list[dict[str, Any]]:
+        project_id = self.project_id()
+        if not project_id:
+            return []
+        with self._connect() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM recovery_events WHERE project_id = ? ORDER BY created_at", (project_id,))]
 
     def acquire_ownership(self, task_id: str, owner: str, files: Sequence[str], operation_id: str) -> list[str]:
         task = self.task(task_id)
@@ -510,6 +577,15 @@ class Ledger:
                 return False
             db.execute("INSERT OR REPLACE INTO leases(project_id, holder, expires_at, acquired_at) VALUES(?,?,?,?)", (project_id, holder, now + ttl, now))
         return True
+
+    def renew_lease(self, holder: str, ttl: int = 60) -> bool:
+        project_id = self.project_id()
+        if not project_id:
+            raise SDDError("project is not initialized")
+        with self._connect() as db:
+            now = utc_now()
+            changed = db.execute("UPDATE leases SET expires_at = ? WHERE project_id = ? AND holder = ? AND expires_at > ?", (now + ttl, project_id, holder, now)).rowcount
+            return changed == 1
 
     def release_lease(self, holder: str) -> None:
         with self._connect() as db:

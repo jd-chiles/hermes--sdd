@@ -1,6 +1,6 @@
 # Sprint 3 — trustworthy acceptance and recoverable execution
 
-Status: active, 2026-09-27. First implementation batch validated locally; routing/escalation integration and host release gates remain open.
+Status: active, 2026-09-28. P0 local routing/recovery primitives and dispatch idempotency are implemented and validated; effective host routing, native budget enforcement, and host release gates remain open.
 
 ## Objective
 
@@ -52,4 +52,13 @@ Enforce broader worker concurrency limits (repair/provider/native-attempt and to
 - Hermes source contract passed at `8f897d2d23a338f7a062ebc4fa7aedc287d087de`: Kanban supports `--model`, `--provider`, and native idempotency keys; its actual worker argv builder forwards model/provider overrides. `--max-retries` is a consecutive-failure breaker, not a lifetime launch cap. Run `python3 scripts/host_routing_contract.py --host-root <hermes-checkout>` to reproduce. This test launches no workers and does not validate provider authorization or effective runtime routes.
 - Validation: 35 local tests pass and Python compilation passes. Full installed-host smoke remains blocked by the runtime installation filesystem as recorded above; remote platform CI has not been rerun.
 
-Next: implement authorized route configuration and effective-route receipts, then the durable escalation/budget state machine. Complete native provisioning/error handling, use native idempotency keys across dispatch interruptions, and renew/reconcile dispatch leases before closing S3-03/04. Do not auto-unblock a failed provider task as a substitute for those missing gates.
+Next: verify effective route receipts against the pinned Hermes host, then complete native attempt-budget and provider cooldown/circuit-breaker enforcement. Complete native provisioning/error handling and lease renewal/reconciliation before closing S3-03/04. Do not auto-unblock a failed provider task as a substitute for those missing gates.
+
+## P0 implementation handoff
+
+- Added `docs/sdd/features/p0-host-execution/spec.md` with stable P0 task IDs and acceptance criteria.
+- Added configured route resolution with explicit `unconfigured`, `routing_unavailable`, `shared_route`, and `configured` states. Effective host routing remains reported as unverified until a host receipt is returned.
+- Added durable dispatch intents and recovery events to schema v3. Replayed pending dispatches fail closed and require reconciliation; completed dispatches are not relaunched.
+- Added owner-checked lease renewal and explicit failure classification/recovery decisions without storing credentials.
+- Added regression coverage for shared routes, distinct routes, failure decisions, dispatch replay, lease renewal, and optional effective-route receipts.
+- Validation: 42 tests pass and Python compilation passes. Pinned-host validation has not been run in this workspace.

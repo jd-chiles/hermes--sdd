@@ -1,6 +1,6 @@
 # Task difficulty, model routing, and escalation
 
-Status: Sprint 3 implementation contract, 2026-09-27. Per-task difficulty assessment is implemented; effective-route configuration and escalation are still pending. This document does not enable routing or reset live task budgets.
+Status: P0 implementation slice, 2026-09-28. Per-task difficulty, configured route resolution, durable failure decisions, and idempotent dispatch intents are implemented locally. Effective host-route receipts, native attempt-cap integration, cooldown/circuit-breaker enforcement, and pinned-host certification remain release gates. This document does not enable routing or reset live task budgets.
 
 ## Current gap
 
