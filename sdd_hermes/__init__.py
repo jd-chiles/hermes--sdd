@@ -8,6 +8,7 @@ public plugin context.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import uuid
@@ -93,13 +94,19 @@ class SDDService:
             intent = self.ledger.dispatch_intent(task_row["task_id"], task["stable_key"], operation_id, {"board": board_slug, "parents": parents, "assignee": task["role"]}, route)
             if intent.get("replayed") and intent.get("state") == "pending":
                 raise SDDError(f"dispatch for {task['stable_key']} is unresolved; reconcile before retry")
-            result = self.bridge.create_task(board_slug, task["title"], body, task["role"], parents, route) if route else self.bridge.create_task(board_slug, task["title"], body, task["role"], parents)
+            limits = (self.ledger.project() or {}).get("limits", {})
+            kwargs: dict[str, Any] = {"idempotency_key": operation_id}
+            kwargs["max_retries"] = int(limits.get("max_native_retries", DEFAULT_LIMITS["max_native_retries"]))
+            supported = inspect.signature(self.bridge.create_task).parameters
+            kwargs = {key: value for key, value in kwargs.items() if key in supported}
+            result = self.bridge.create_task(board_slug, task["title"], body, task["role"], parents, route, **kwargs) if route else self.bridge.create_task(board_slug, task["title"], body, task["role"], parents, **kwargs)
             native_id = self.bridge.decode_task_id(result.get("result") if isinstance(result, dict) else result)
             if not native_id:
                 raise SDDError(f"native creation returned no ID for {task['stable_key']}; reconcile before retry")
             if native_id:
                 self.ledger.set_native_task_id(task_row["task_id"], native_id)
-                self.ledger.complete_dispatch(operation_id, native_id)
+                raw_receipt = result.get("result") if isinstance(result, dict) else result
+                self.ledger.complete_dispatch(operation_id, native_id, self.bridge.effective_route(raw_receipt))
                 native[task["stable_key"]] = native_id
             created.append({"stable_key": task["stable_key"], "native_task_id": native_id, "result": result, "effective_route": self.bridge.effective_route(result.get("result") if isinstance(result, dict) else result)})
         return {"profiles": provisioned, "board": board, "created": created, "native_task_ids": native, "routing": routing}
@@ -125,6 +132,8 @@ class SDDService:
             status["routing"]["effective_host_routes"] = "unverified"
             status["dispatches"] = self.ledger.dispatches()
             status["recovery_events"] = self.ledger.recovery_events()
+            status["budgets"] = self.ledger.budgets()
+            status["route_breakers"] = self.ledger.breakers()
         return status
 
     def admit(self, task_id: str, files: list[str], operation_id: str) -> dict[str, Any]:
@@ -192,10 +201,32 @@ class SDDService:
         finally:
             self.ledger.release_lease(holder)
 
-    def record_failure(self, task_id: str, code: str, phase: str = "dispatch", route_identity: str = "unknown") -> dict[str, Any]:
+    def record_failure(self, task_id: str, code: str, phase: str = "dispatch", route_identity: str = "unknown", retry_after: int | None = None) -> dict[str, Any]:
         failure = classify_failure(code, phase)
         decision = recovery_decision(failure["class"], route_identity)
-        return self.ledger.record_recovery(task_id, failure, decision, route_identity)
+        if retry_after is not None:
+            decision["retry_after_seconds"] = max(0, int(retry_after))
+        return self.ledger.record_recovery(task_id, failure, decision, route_identity, retry_after)
+
+    def admit_recovery(self, task_id: str, failure_class: str, route_identity: str, actionable_change: str | None) -> dict[str, Any]:
+        return self.ledger.recovery_admission(task_id, failure_class, route_identity, actionable_change)
+
+    def recover_task(self, task_id: str, failure_class: str, route_identity: str, actionable_change: str) -> dict[str, Any]:
+        """Reserve recovery budget before promoting a blocked native task."""
+        task = self.ledger.task(task_id)
+        project = self.ledger.project()
+        if not task or not project or not task.get("native_task_id"):
+            return {"admitted": False, "blocked": "native task receipt is required before recovery"}
+        admission = self.ledger.recovery_admission(task_id, failure_class, route_identity, actionable_change)
+        if not admission.get("allowed"):
+            return {"admitted": False, "admission": admission}
+        result = self.bridge.promote_task(project["board_slug"], task["native_task_id"], actionable_change)
+        try:
+            receipt = HermesBridge.decode_response(result)
+        except SDDError:
+            self.record_failure(task_id, "unknown_or_ambiguous", "recovery", route_identity)
+            raise
+        return {"admitted": True, "admission": admission, "native_task_id": task["native_task_id"], "result": receipt}
 
 
 def _root_from_params(params: dict[str, Any]) -> Path:
@@ -232,6 +263,10 @@ def _handle_tool(ctx: Any, name: str, params: dict[str, Any]) -> str:
             result = service.resume()
         elif name == "recover":
             result = service.recover()
+        elif name == "admit_recovery":
+            result = service.admit_recovery(params["task_id"], params["failure_class"], params["route_identity"], params.get("actionable_change"))
+        elif name == "recover_task":
+            result = service.recover_task(params["task_id"], params["failure_class"], params["route_identity"], params["actionable_change"])
         else:
             raise SDDError(f"unknown SDD operation: {name}")
         return _json(result)
@@ -252,6 +287,8 @@ def _schemas() -> dict[str, dict[str, Any]]:
         "pause": {"name": "sdd_pause", "description": "Pause SDD dispatch while preserving durable progress.", "parameters": {"type": "object", "properties": {"project_root": root}}},
         "resume": {"name": "sdd_resume", "description": "Resume and reconcile a paused SDD project.", "parameters": {"type": "object", "properties": {"project_root": root}}},
         "recover": {"name": "sdd_recover", "description": "Reconcile native Kanban references and the SDD ledger after interruption using a project-scoped lease.", "parameters": {"type": "object", "properties": {"project_root": root}}},
+        "admit_recovery": {"name": "sdd_admit_recovery", "description": "Reserve a durable repair or provider-recovery budget only when the failure and recovery change are admissible.", "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}, "failure_class": {"type": "string"}, "route_identity": {"type": "string"}, "actionable_change": {"type": "string"}, "project_root": root}, "required": ["task_id", "failure_class", "route_identity"]}},
+        "recover_task": {"name": "sdd_recover_task", "description": "Admit a durable recovery and promote its existing native task without creating a duplicate.", "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}, "failure_class": {"type": "string"}, "route_identity": {"type": "string"}, "actionable_change": {"type": "string"}, "project_root": root}, "required": ["task_id", "failure_class", "route_identity", "actionable_change"]}},
     }
 
 

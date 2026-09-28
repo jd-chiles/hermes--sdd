@@ -89,8 +89,62 @@ class CoordinationTests(unittest.TestCase):
         self.assertEqual(result['decision']['state'], 'waiting_provider')
         self.assertEqual(self.service.status()['recovery_events'][0]['failure_class'], 'provider_transient')
 
+    def test_provider_cooldown_blocks_sibling_recovery_without_spending_budget(self):
+        task = self.service.ledger.tasks()[0]
+        self.service.record_failure(task['task_id'], '429', route_identity='provider/model@default')
+        blocked = self.service.admit_recovery(task['task_id'], 'provider_transient', 'provider/model@default', 'distinct_effective_route')
+        self.assertFalse(blocked['allowed'])
+        self.assertEqual(blocked['state'], 'waiting_provider')
+        self.assertEqual(self.service.status()['budgets'], [])
+        restarted = SDDService(self.root)
+        self.assertEqual(restarted.status()['route_breakers'][0]['route_identity'], 'provider/model@default')
+
+    def test_expired_breaker_allows_one_half_open_probe(self):
+        task = self.service.ledger.tasks()[0]
+        self.service.record_failure(task['task_id'], '429', route_identity='provider/model@default', retry_after=0)
+        first = self.service.admit_recovery(task['task_id'], 'provider_transient', 'provider/model@default', 'health_signal')
+        second = self.service.admit_recovery(task['task_id'], 'provider_transient', 'provider/model@default', 'health_signal')
+        self.assertTrue(first['allowed'])
+        self.assertFalse(second['allowed'])
+        self.assertEqual(second['reason'], 'half-open provider probe already claimed')
+
+    def test_recovery_budgets_are_distinct_and_durable(self):
+        task = self.service.ledger.tasks()[0]
+        first = self.service.admit_recovery(task['task_id'], 'task_defect', 'provider/model@default', 'changed_repair_plan')
+        second = self.service.admit_recovery(task['task_id'], 'task_defect', 'provider/model@default', 'changed_repair_plan')
+        third = self.service.admit_recovery(task['task_id'], 'task_defect', 'provider/model@default', 'changed_repair_plan')
+        self.assertTrue(first['allowed'] and second['allowed'])
+        self.assertFalse(third['allowed'])
+        self.assertEqual(third['reason'], 'repair budget exhausted')
+        self.assertEqual(SDDService(self.root).status()['budgets'][0]['repair_cycles'], 2)
+
+    def test_effective_route_receipt_is_persisted_on_dispatch_completion(self):
+        task = self.service.ledger.tasks()[0]
+        self.service.ledger.dispatch_intent(task['task_id'], task['stable_key'], 'dispatch-receipt', {'parents': []}, {'provider': 'p', 'model': 'requested'})
+        self.service.ledger.complete_dispatch('dispatch-receipt', 'native-1', {'provider': 'p', 'model': 'effective'})
+        row = self.service.status()['dispatches'][0]
+        self.assertEqual(json.loads(row['effective_route_json'])['model'], 'effective')
+        self.assertEqual(self.service.status()['budgets'][0]['native_launches'], 1)
+
+    def test_recover_task_admits_budget_before_promoting_native_task(self):
+        commands = []
+        service = SDDService(self.root, HermesBridge(lambda name, args: commands.append(args['command']) or {'exit_code': 0, 'output': '{}'}))
+        task = service.ledger.tasks()[0]
+        service.ledger.set_native_task_id(task['task_id'], 'native-1')
+        result = service.recover_task(task['task_id'], 'task_defect', 'provider/model@default', 'changed repair plan')
+        self.assertTrue(result['admitted'])
+        self.assertIn('promote native-1', commands[0])
+        self.assertEqual(service.status()['budgets'][0]['repair_cycles'], 1)
+
 
 class BridgeTests(unittest.TestCase):
+    def test_create_task_propagates_native_idempotency_and_retry_controls(self):
+        commands = []
+        bridge = HermesBridge(lambda name, args: commands.append(args['command']) or {'exit_code': 0, 'output': json.dumps({'id': 'native-1'})})
+        bridge.create_task('board', 'title', 'body', 'engineer', idempotency_key='op-1', max_retries=3)
+        self.assertIn('--idempotency-key op-1', commands[0])
+        self.assertIn('--max-retries 3', commands[0])
+
     def test_terminal_envelope_and_numeric_task_id(self):
         result = json.dumps({'exit_code': 0, 'output': json.dumps({'id': 240})})
         self.assertEqual(HermesBridge.decode_task_id(result), '240')
@@ -130,3 +184,12 @@ class BridgeTests(unittest.TestCase):
     def test_effective_route_receipt_is_optional_and_explicit(self):
         self.assertEqual(HermesBridge.effective_route({'effective_route': {'provider': 'p', 'model': 'm'}})['model'], 'm')
         self.assertIsNone(HermesBridge.effective_route({'id': 'native-1'}))
+        self.assertEqual(HermesBridge.retry_after_seconds({'headers': {'Retry-After': '12'}}), 12)
+        self.assertIsNone(HermesBridge.retry_after_seconds({'message': 'try later'}))
+
+    def test_promote_task_uses_native_recovery_command(self):
+        commands = []
+        bridge = HermesBridge(lambda name, args: commands.append(args['command']) or {'exit_code': 0, 'output': '{}'})
+        bridge.promote_task('board', 'native-1', 'changed route')
+        self.assertIn('promote native-1', commands[0])
+        self.assertIn('--json', commands[0])

@@ -58,7 +58,7 @@ class HermesBridge:
             results.append({"profile": name, "create": create, "enable": enable})
         return results
 
-    def create_task(self, board_slug: str, title: str, body: str, assignee: str, parents: list[str] | None = None, route: dict[str, Any] | None = None) -> dict[str, Any]:
+    def create_task(self, board_slug: str, title: str, body: str, assignee: str, parents: list[str] | None = None, route: dict[str, Any] | None = None, idempotency_key: str | None = None, max_retries: int | None = None) -> dict[str, Any]:
         if not self.dispatch:
             return {"available": False}
         command = f"hermes kanban --board {shlex.quote(board_slug)} create {shlex.quote(title)} --body {shlex.quote(body)} --assignee {shlex.quote(assignee)} --completion-contract local-only --json"
@@ -69,6 +69,10 @@ class HermesBridge:
                 command += f" --provider {shlex.quote(str(route['provider']))}"
             if route.get("model"):
                 command += f" --model {shlex.quote(str(route['model']))}"
+        if idempotency_key:
+            command += f" --idempotency-key {shlex.quote(idempotency_key)}"
+        if max_retries is not None:
+            command += f" --max-retries {int(max_retries)}"
         raw = self.terminal(command)
         return {"available": True, "result": raw}
 
@@ -80,6 +84,20 @@ class HermesBridge:
             return None
         route = decoded.get("effective_route") or decoded.get("route")
         return dict(route) if isinstance(route, dict) else None
+
+    @staticmethod
+    def retry_after_seconds(result: Any) -> int | None:
+        """Read a structured retry delay without interpreting worker prose."""
+        decoded = HermesBridge.decode_response(result)
+        if not isinstance(decoded, dict):
+            return None
+        value = decoded.get("retry_after")
+        if value is None and isinstance(decoded.get("headers"), dict):
+            value = decoded["headers"].get("retry-after") or decoded["headers"].get("Retry-After")
+        try:
+            return max(0, int(value)) if value is not None else None
+        except (TypeError, ValueError):
+            return None
 
     def find_task(self, board_slug: str, stable_key: str) -> str | None:
         """Find an already-created task during recovery using its stable body key."""
@@ -111,6 +129,12 @@ class HermesBridge:
         command = f"hermes kanban --board {shlex.quote(board_slug)} {action} {shlex.quote(native_task_id)}"
         if action == "block":
             command += f" {shlex.quote(reason or 'SDD pause requested')}"
+        return self.terminal(command)
+
+    def promote_task(self, board_slug: str, native_task_id: str, reason: str = "SDD recovery admitted") -> Any:
+        if not self.dispatch:
+            return {"available": False}
+        command = f"hermes kanban --board {shlex.quote(board_slug)} promote {shlex.quote(native_task_id)} {shlex.quote(reason)} --json"
         return self.terminal(command)
 
     @staticmethod

@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = 3
-DEFAULT_LIMITS = {"max_workers": 3, "max_repairs": 2, "max_runtime_seconds": 3600}
+SCHEMA_VERSION = 4
+DEFAULT_LIMITS = {"max_workers": 3, "max_repairs": 2, "max_provider_recoveries": 2, "max_native_retries": 3, "max_runtime_seconds": 3600}
 
 
 class SDDError(RuntimeError):
@@ -196,13 +196,24 @@ class Ledger:
                     operation_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(project_id),
                     task_id TEXT NOT NULL REFERENCES tasks(task_id), stable_key TEXT NOT NULL,
                     payload_json TEXT NOT NULL, route_json TEXT NOT NULL, state TEXT NOT NULL,
-                    native_task_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                    native_task_id TEXT, effective_route_json TEXT NOT NULL DEFAULT '{}',
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS recovery_events (
                     event_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(project_id),
                     task_id TEXT NOT NULL REFERENCES tasks(task_id), failure_class TEXT NOT NULL,
                     phase TEXT NOT NULL, code TEXT NOT NULL, state TEXT NOT NULL,
                     route_identity TEXT NOT NULL, decision_json TEXT NOT NULL, created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS task_budgets (
+                    task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), repair_cycles INTEGER NOT NULL DEFAULT 0,
+                    provider_recoveries INTEGER NOT NULL DEFAULT 0, native_launches INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS route_breakers (
+                    route_identity TEXT PRIMARY KEY, failure_count INTEGER NOT NULL DEFAULT 0,
+                    opened_until INTEGER NOT NULL DEFAULT 0, last_failure_at INTEGER NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'closed', half_open_claimed INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TRIGGER IF NOT EXISTS attempts_immutable_update
                     BEFORE UPDATE ON attempts BEGIN SELECT RAISE(ABORT, 'attempts are immutable'); END;
@@ -217,6 +228,14 @@ class Ledger:
             version = db.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()
             if version and int(version[0]) > SCHEMA_VERSION:
                 raise SDDError("ledger was written by a newer plugin; upgrade before continuing")
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(dispatches)")}
+            if "effective_route_json" not in columns:
+                db.execute("ALTER TABLE dispatches ADD COLUMN effective_route_json TEXT NOT NULL DEFAULT '{}'")
+            breaker_columns = {row["name"] for row in db.execute("PRAGMA table_info(route_breakers)")}
+            if "state" not in breaker_columns:
+                db.execute("ALTER TABLE route_breakers ADD COLUMN state TEXT NOT NULL DEFAULT 'closed'")
+            if "half_open_claimed" not in breaker_columns:
+                db.execute("ALTER TABLE route_breakers ADD COLUMN half_open_claimed INTEGER NOT NULL DEFAULT 0")
             db.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
 
     def append_event(self, project_id: str, event_type: str, payload: Mapping[str, Any], operation_id: str | None = None) -> bool:
@@ -335,12 +354,18 @@ class Ledger:
             )
             return {"operation_id": operation_id, "project_id": project_id, "task_id": task_id, "stable_key": stable_key, "state": "pending", "native_task_id": None, "replayed": False}
 
-    def complete_dispatch(self, operation_id: str, native_task_id: str) -> None:
+    def complete_dispatch(self, operation_id: str, native_task_id: str, effective_route: Mapping[str, Any] | None = None) -> None:
         with self._connect() as db:
             row = db.execute("SELECT * FROM dispatches WHERE operation_id = ?", (operation_id,)).fetchone()
             if not row:
                 raise SDDError("unknown dispatch operation")
-            db.execute("UPDATE dispatches SET state = 'completed', native_task_id = ?, updated_at = ? WHERE operation_id = ?", (native_task_id, utc_now(), operation_id))
+            now = utc_now()
+            db.execute("UPDATE dispatches SET state = 'completed', native_task_id = ?, effective_route_json = ?, updated_at = ? WHERE operation_id = ?", (native_task_id, json_text(effective_route or {}), now, operation_id))
+            db.execute("INSERT OR IGNORE INTO task_budgets(task_id, updated_at) VALUES(?,?)", (row["task_id"], now))
+            db.execute("UPDATE task_budgets SET native_launches = native_launches + 1, updated_at = ? WHERE task_id = ?", (now, row["task_id"]))
+            if effective_route:
+                identity = f"{effective_route.get('provider', '')}/{effective_route.get('model', '')}@{effective_route.get('endpoint') or 'default'}"
+                db.execute("UPDATE route_breakers SET state = 'closed', opened_until = 0, half_open_claimed = 0 WHERE route_identity = ?", (identity,))
 
     def dispatches(self) -> list[dict[str, Any]]:
         project_id = self.project_id()
@@ -349,7 +374,7 @@ class Ledger:
         with self._connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM dispatches WHERE project_id = ? ORDER BY created_at", (project_id,))]
 
-    def record_recovery(self, task_id: str, failure: Mapping[str, str], decision: Mapping[str, Any], route_identity: str) -> dict[str, Any]:
+    def record_recovery(self, task_id: str, failure: Mapping[str, str], decision: Mapping[str, Any], route_identity: str, retry_after: int | None = None) -> dict[str, Any]:
         task = self.task(task_id)
         if not task:
             raise SDDError(f"unknown task: {task_id}")
@@ -359,6 +384,10 @@ class Ledger:
                 "INSERT INTO recovery_events(event_id, project_id, task_id, failure_class, phase, code, state, route_identity, decision_json, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (event_id, task["project_id"], task_id, failure["class"], failure.get("phase", "dispatch"), failure.get("code", ""), decision["state"], route_identity, json_text(decision), utc_now()),
             )
+            if failure["class"] == "provider_transient":
+                now = utc_now()
+                cooldown = max(0, int(retry_after if retry_after is not None else 60))
+                db.execute("INSERT INTO route_breakers(route_identity, failure_count, opened_until, last_failure_at, state, half_open_claimed) VALUES(?,?,?,?,?,?) ON CONFLICT(route_identity) DO UPDATE SET failure_count = failure_count + 1, opened_until = excluded.opened_until, last_failure_at = excluded.last_failure_at, state = 'open', half_open_claimed = 0", (route_identity, 1, now + cooldown, now, "open", 0))
         return {"event_id": event_id, "task_id": task_id, "failure": dict(failure), "decision": dict(decision), "route_identity": route_identity}
 
     def recovery_events(self) -> list[dict[str, Any]]:
@@ -367,6 +396,54 @@ class Ledger:
             return []
         with self._connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM recovery_events WHERE project_id = ? ORDER BY created_at", (project_id,))]
+
+    def recovery_admission(self, task_id: str, failure_class: str, route_identity: str, actionable_change: str | None) -> dict[str, Any]:
+        """Reserve a repair/provider budget only when every durable gate passes."""
+        task = self.task(task_id)
+        if not task:
+            raise SDDError(f"unknown task: {task_id}")
+        project_id = task["project_id"]
+        now = utc_now()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            project = db.execute("SELECT paused, limits_json FROM projects WHERE project_id = ?", (project_id,)).fetchone()
+            if project["paused"]:
+                return {"allowed": False, "state": "blocked", "reason": "project is paused"}
+            breaker = db.execute("SELECT * FROM route_breakers WHERE route_identity = ?", (route_identity,)).fetchone()
+            if failure_class == "provider_transient" and breaker and breaker["opened_until"] > now:
+                return {"allowed": False, "state": "waiting_provider", "reason": "route cooldown is active", "retry_at": breaker["opened_until"]}
+            if failure_class == "provider_transient" and breaker and breaker["state"] in {"open", "half_open"}:
+                if breaker["half_open_claimed"]:
+                    return {"allowed": False, "state": "waiting_provider", "reason": "half-open provider probe already claimed"}
+                db.execute("UPDATE route_breakers SET state = 'half_open', half_open_claimed = 1 WHERE route_identity = ?", (route_identity,))
+            if not actionable_change:
+                return {"allowed": False, "state": "waiting_provider" if failure_class == "provider_transient" else "blocked", "reason": "an actionable recovery change is required"}
+            limits = json.loads(project["limits_json"])
+            db.execute("INSERT OR IGNORE INTO task_budgets(task_id, updated_at) VALUES(?,?)", (task_id, now))
+            budget = db.execute("SELECT * FROM task_budgets WHERE task_id = ?", (task_id,)).fetchone()
+            if failure_class == "task_defect":
+                if budget["repair_cycles"] >= int(limits.get("max_repairs", DEFAULT_LIMITS["max_repairs"])):
+                    return {"allowed": False, "state": "blocked", "reason": "repair budget exhausted"}
+                column = "repair_cycles"
+            elif failure_class == "provider_transient":
+                if budget["provider_recoveries"] >= int(limits.get("max_provider_recoveries", DEFAULT_LIMITS["max_provider_recoveries"])):
+                    return {"allowed": False, "state": "blocked", "reason": "provider recovery budget exhausted"}
+                column = "provider_recoveries"
+            else:
+                return {"allowed": False, "state": "blocked", "reason": f"failure class {failure_class} is not launch-admissible"}
+            db.execute(f"UPDATE task_budgets SET {column} = {column} + 1, updated_at = ? WHERE task_id = ?", (now, task_id))
+            return {"allowed": True, "state": "dispatch_pending", "budget": column}
+
+    def budgets(self) -> list[dict[str, Any]]:
+        project_id = self.project_id()
+        if not project_id:
+            return []
+        with self._connect() as db:
+            return [dict(row) for row in db.execute("SELECT b.* FROM task_budgets b JOIN tasks t ON t.task_id = b.task_id WHERE t.project_id = ? ORDER BY b.task_id", (project_id,))]
+
+    def breakers(self) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM route_breakers ORDER BY route_identity")]
 
     def acquire_ownership(self, task_id: str, owner: str, files: Sequence[str], operation_id: str) -> list[str]:
         task = self.task(task_id)
