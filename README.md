@@ -22,6 +22,7 @@ The package is a native Hermes plugin (`plugin.yaml` + `register(ctx)`). It does
 /sdd pause
 /sdd resume
 /sdd recover
+/sdd close
 /sdd doctor
 ```
 
@@ -50,7 +51,7 @@ python3 -m unittest discover -s tests -v
 python3 -m compileall -q sdd_hermes scripts
 ```
 
-Sprint 3 is underway: see the [prioritized review](docs/reviews/sprint-3-review.md) and [sprint backlog](docs/sprints/sprint-3.md).
+Sprint 5 is underway: see the [sprint backlog](docs/sprints/sprint-5.md) and [spec-driven development package](docs/sdd/features/sprint-5-lifecycle/).
 
 Release checks build and inspect the real artifact:
 

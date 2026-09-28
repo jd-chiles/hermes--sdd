@@ -107,6 +107,33 @@ class CoordinationTests(unittest.TestCase):
         self.assertTrue(self.service.ledger.renew_lease('holder'))
         self.assertFalse(self.service.ledger.renew_lease('other'))
 
+    def test_worker_capacity_is_enforced_and_completion_is_restart_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = SDDService(root)
+            service.initialize('Fix regression', 'bugfix', limits={'max_workers': 1, 'estimated_runtime_seconds': 300})
+            tasks = service.ledger.tasks()
+            first = service.ledger.admit_capacity(tasks[0]['task_id'], 'capacity-1', 'coordinator-1', 300)
+            second = service.ledger.admit_capacity(tasks[1]['task_id'], 'capacity-2', 'coordinator-2', 300)
+            self.assertTrue(first['allowed'])
+            self.assertFalse(second['allowed'])
+            self.assertEqual(second['blocked'], 'max_workers')
+            self.assertEqual(SDDService(root).status()['capacity'][0]['state'], 'reserved')
+            completed = SDDService(root).complete_task('capacity-1', 42)
+            self.assertFalse(completed['idempotent'])
+            self.assertTrue(SDDService(root).complete_task('capacity-1', 42)['idempotent'])
+
+    def test_total_runtime_cap_blocks_before_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = SDDService(Path(directory))
+            service.initialize('Fix regression', 'bugfix', limits={'max_total_runtime_seconds': 300, 'estimated_runtime_seconds': 300})
+            task = service.ledger.tasks()[0]
+            allowed = service.ledger.admit_capacity(task['task_id'], 'runtime-1', 'coordinator', 300)
+            blocked = service.ledger.admit_capacity(service.ledger.tasks()[1]['task_id'], 'runtime-2', 'coordinator', 300)
+            self.assertTrue(allowed['allowed'])
+            self.assertEqual(blocked['blocked'], 'total_runtime')
+            self.assertEqual(service.status()['limit_blockers'][0]['unblock_condition'], 'complete an active reservation or increase the total runtime cap')
+
     def test_failure_recovery_is_durable_and_does_not_change_task_tier(self):
         task = self.service.ledger.tasks()[0]
         result = self.service.record_failure(task['task_id'], '429', route_identity='provider/model@default')

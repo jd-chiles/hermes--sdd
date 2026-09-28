@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = 4
-DEFAULT_LIMITS = {"max_workers": 3, "max_repairs": 2, "max_provider_recoveries": 2, "max_native_retries": 3, "max_runtime_seconds": 3600}
+SCHEMA_VERSION = 5
+DEFAULT_LIMITS = {"max_workers": 3, "max_repairs": 2, "max_provider_recoveries": 2, "max_native_retries": 3, "max_runtime_seconds": 3600, "max_total_runtime_seconds": 3600, "estimated_runtime_seconds": 300}
 
 
 class SDDError(RuntimeError):
@@ -215,6 +215,24 @@ class Ledger:
                     opened_until INTEGER NOT NULL DEFAULT 0, last_failure_at INTEGER NOT NULL,
                     state TEXT NOT NULL DEFAULT 'closed', half_open_claimed INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS worker_reservations (
+                    operation_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(project_id),
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id), holder TEXT NOT NULL,
+                    state TEXT NOT NULL, reserved_seconds INTEGER NOT NULL,
+                    reserved_at INTEGER NOT NULL, released_at INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS runtime_reservations (
+                    operation_id TEXT PRIMARY KEY REFERENCES worker_reservations(operation_id),
+                    project_id TEXT NOT NULL REFERENCES projects(project_id), task_id TEXT NOT NULL REFERENCES tasks(task_id),
+                    reserved_seconds INTEGER NOT NULL, actual_seconds INTEGER NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL, started_at INTEGER NOT NULL, completed_at INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS limit_blockers (
+                    blocker_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(project_id),
+                    task_id TEXT REFERENCES tasks(task_id), operation_id TEXT NOT NULL,
+                    limit_name TEXT NOT NULL, usage INTEGER NOT NULL, cap INTEGER NOT NULL,
+                    unblock_condition TEXT NOT NULL, created_at INTEGER NOT NULL, resolved_at INTEGER
+                );
                 CREATE TRIGGER IF NOT EXISTS attempts_immutable_update
                     BEFORE UPDATE ON attempts BEGIN SELECT RAISE(ABORT, 'attempts are immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS attempts_immutable_delete
@@ -329,6 +347,9 @@ class Ledger:
                 return {"closed": True, "project_id": project_id, "idempotent": True}
             if project["paused"] or project["stage"] != "accepted":
                 raise SDDError("only an unpaused accepted project can be closed")
+            active = db.execute("SELECT COUNT(*) FROM worker_reservations WHERE project_id = ? AND state IN ('reserved', 'running')", (project_id,)).fetchone()[0]
+            if active:
+                raise SDDError("cannot close while worker reservations are active")
             db.execute("UPDATE projects SET stage = 'closed', updated_at = ? WHERE project_id = ?", (utc_now(), project_id))
         self.append_event(project_id, "project_closed", {"stage": "accepted"}, f"{project_id}:closed")
         return {"closed": True, "project_id": project_id, "idempotent": False}
@@ -352,6 +373,74 @@ class Ledger:
     def set_task_status(self, task_id: str, status: str) -> None:
         with self._connect() as db:
             db.execute("UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?", (status, utc_now(), task_id))
+
+    def admit_capacity(self, task_id: str, operation_id: str, holder: str, runtime_seconds: int) -> dict[str, Any]:
+        """Atomically reserve worker and runtime capacity before native dispatch."""
+        task = self.task(task_id)
+        if not task:
+            raise SDDError(f"unknown task: {task_id}")
+        project_id = task["project_id"]
+        now = utc_now()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute("SELECT * FROM worker_reservations WHERE operation_id = ?", (operation_id,)).fetchone()
+            if existing:
+                return {**dict(existing), "allowed": existing["state"] in {"reserved", "running"}, "replayed": True}
+            project = db.execute("SELECT paused, limits_json FROM projects WHERE project_id = ?", (project_id,)).fetchone()
+            limits = json.loads(project["limits_json"])
+            max_workers = int(limits.get("max_workers", DEFAULT_LIMITS["max_workers"]))
+            max_runtime = int(limits.get("max_runtime_seconds", DEFAULT_LIMITS["max_runtime_seconds"]))
+            max_total_runtime = int(limits.get("max_total_runtime_seconds", DEFAULT_LIMITS["max_total_runtime_seconds"]))
+            active = db.execute("SELECT COUNT(*) FROM worker_reservations WHERE project_id = ? AND state IN ('reserved', 'running')", (project_id,)).fetchone()[0]
+            reserved_runtime = db.execute("SELECT COALESCE(SUM(reserved_seconds), 0) FROM runtime_reservations WHERE project_id = ? AND state IN ('reserved', 'running')", (project_id,)).fetchone()[0]
+
+            def blocked(limit_name: str, usage: int, cap: int, condition: str) -> dict[str, Any]:
+                blocker_id = str(uuid.uuid4())
+                db.execute("INSERT INTO limit_blockers(blocker_id, project_id, task_id, operation_id, limit_name, usage, cap, unblock_condition, created_at, resolved_at) VALUES(?,?,?,?,?,?,?,?,?,NULL)", (blocker_id, project_id, task_id, operation_id, limit_name, usage, cap, condition, now))
+                return {"allowed": False, "blocked": limit_name, "usage": usage, "cap": cap, "unblock_condition": condition, "blocker_id": blocker_id, "replayed": False}
+
+            if project["paused"]:
+                return blocked("paused", 1, 0, "resume the project")
+            if runtime_seconds <= 0 or runtime_seconds > max_runtime:
+                return blocked("task_runtime", runtime_seconds, max_runtime, "choose a runtime within the configured cap")
+            if active >= max_workers:
+                return blocked("max_workers", active, max_workers, "complete or release an active worker reservation")
+            if reserved_runtime + runtime_seconds > max_total_runtime:
+                return blocked("total_runtime", reserved_runtime + runtime_seconds, max_total_runtime, "complete an active reservation or increase the total runtime cap")
+            db.execute("INSERT INTO worker_reservations(operation_id, project_id, task_id, holder, state, reserved_seconds, reserved_at, released_at) VALUES(?,?,?,?,?,?,?,NULL)", (operation_id, project_id, task_id, holder, "reserved", runtime_seconds, now))
+            db.execute("INSERT INTO runtime_reservations(operation_id, project_id, task_id, reserved_seconds, actual_seconds, state, started_at, completed_at) VALUES(?,?,?,?,?,?,?,NULL)", (operation_id, project_id, task_id, runtime_seconds, 0, "reserved", now))
+            return {"allowed": True, "operation_id": operation_id, "task_id": task_id, "reserved_seconds": runtime_seconds, "replayed": False}
+
+    def complete_capacity(self, operation_id: str, actual_seconds: int, state: str = "completed") -> dict[str, Any]:
+        if state not in {"completed", "failed", "released", "ambiguous"}:
+            raise SDDError(f"invalid capacity completion state: {state}")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            reservation = db.execute("SELECT * FROM worker_reservations WHERE operation_id = ?", (operation_id,)).fetchone()
+            runtime = db.execute("SELECT * FROM runtime_reservations WHERE operation_id = ?", (operation_id,)).fetchone()
+            if not reservation or not runtime:
+                raise SDDError("unknown capacity reservation")
+            if reservation["state"] not in {"reserved", "running"}:
+                return {"operation_id": operation_id, "state": reservation["state"], "idempotent": True}
+            now = utc_now()
+            db.execute("UPDATE worker_reservations SET state = ?, released_at = ? WHERE operation_id = ?", (state, now, operation_id))
+            db.execute("UPDATE runtime_reservations SET state = ?, actual_seconds = ?, completed_at = ? WHERE operation_id = ?", (state, max(0, int(actual_seconds)), now, operation_id))
+            db.execute("UPDATE limit_blockers SET resolved_at = ? WHERE project_id = ? AND resolved_at IS NULL AND limit_name IN ('max_workers', 'total_runtime')", (now, reservation["project_id"]))
+            return {"operation_id": operation_id, "state": state, "actual_seconds": max(0, int(actual_seconds)), "idempotent": False}
+
+    def capacity(self) -> list[dict[str, Any]]:
+        project_id = self.project_id()
+        if not project_id:
+            return []
+        with self._connect() as db:
+            return [dict(row) for row in db.execute("SELECT w.*, r.actual_seconds, r.state AS runtime_state FROM worker_reservations w JOIN runtime_reservations r ON r.operation_id = w.operation_id WHERE w.project_id = ? ORDER BY w.reserved_at", (project_id,))]
+
+    def blockers(self) -> list[dict[str, Any]]:
+        project_id = self.project_id()
+        if not project_id:
+            return []
+        with self._connect() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM limit_blockers WHERE project_id = ? AND resolved_at IS NULL ORDER BY created_at DESC", (project_id,))]
 
     def dispatch_intent(self, task_id: str, stable_key: str, operation_id: str, payload: Mapping[str, Any], route: Mapping[str, Any]) -> dict[str, Any]:
         task = self.task(task_id)

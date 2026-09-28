@@ -91,10 +91,17 @@ class SDDService:
             body = f"SDD project: {plan.slug}\nStable task: {task['stable_key']}\nRole: {task['role']}\nAcceptance criteria: {', '.join(c['id'] for c in plan.criteria)}\nDo not claim completion without submitting evidence through the SDD tools."
             route = routing.get("routes", {}).get(task.get("difficulty", {}).get("tier", "med"), {})
             operation_id = f"{self.ledger.project()['project_id']}:dispatch:{task['stable_key']}"
+            existing_dispatch = next((item for item in self.ledger.dispatches() if item["operation_id"] == operation_id), None)
+            if existing_dispatch and existing_dispatch["state"] == "pending":
+                raise SDDError(f"dispatch for {task['stable_key']} is unresolved; reconcile before retry")
+            limits = (self.ledger.project() or {}).get("limits", {})
+            estimated_runtime = int(limits.get("estimated_runtime_seconds", DEFAULT_LIMITS["estimated_runtime_seconds"]))
+            capacity = self.ledger.admit_capacity(task_row["task_id"], operation_id, self.actor, estimated_runtime)
+            if not capacity.get("allowed"):
+                raise SDDError(f"dispatch blocked by {capacity['blocked']}: {capacity['unblock_condition']}")
             intent = self.ledger.dispatch_intent(task_row["task_id"], task["stable_key"], operation_id, {"board": board_slug, "parents": parents, "assignee": task["role"]}, route)
             if intent.get("replayed") and intent.get("state") == "pending":
                 raise SDDError(f"dispatch for {task['stable_key']} is unresolved; reconcile before retry")
-            limits = (self.ledger.project() or {}).get("limits", {})
             kwargs: dict[str, Any] = {"idempotency_key": operation_id}
             kwargs["max_retries"] = int(limits.get("max_native_retries", DEFAULT_LIMITS["max_native_retries"]))
             supported = inspect.signature(self.bridge.create_task).parameters
@@ -134,6 +141,8 @@ class SDDService:
             status["recovery_events"] = self.ledger.recovery_events()
             status["budgets"] = self.ledger.budgets()
             status["route_breakers"] = self.ledger.breakers()
+            status["capacity"] = self.ledger.capacity()
+            status["limit_blockers"] = self.ledger.blockers()
         return status
 
     def admit(self, task_id: str, files: list[str], operation_id: str) -> dict[str, Any]:
@@ -231,6 +240,9 @@ class SDDService:
             raise
         return {"admitted": True, "admission": admission, "native_task_id": task["native_task_id"], "result": receipt}
 
+    def complete_task(self, operation_id: str, actual_seconds: int, state: str = "completed") -> dict[str, Any]:
+        return self.ledger.complete_capacity(operation_id, actual_seconds, state)
+
 
 def _root_from_params(params: dict[str, Any]) -> Path:
     return Path(params.get("project_root") or os.getcwd()).expanduser().resolve()
@@ -272,6 +284,8 @@ def _handle_tool(ctx: Any, name: str, params: dict[str, Any]) -> str:
             result = service.admit_recovery(params["task_id"], params["failure_class"], params["route_identity"], params.get("actionable_change"))
         elif name == "recover_task":
             result = service.recover_task(params["task_id"], params["failure_class"], params["route_identity"], params["actionable_change"])
+        elif name == "complete_task":
+            result = service.complete_task(params["operation_id"], int(params["actual_seconds"]), params.get("state", "completed"))
         else:
             raise SDDError(f"unknown SDD operation: {name}")
         return _json(result)
@@ -295,6 +309,7 @@ def _schemas() -> dict[str, dict[str, Any]]:
         "recover": {"name": "sdd_recover", "description": "Reconcile native Kanban references and the SDD ledger after interruption using a project-scoped lease.", "parameters": {"type": "object", "properties": {"project_root": root}}},
         "admit_recovery": {"name": "sdd_admit_recovery", "description": "Reserve a durable repair or provider-recovery budget only when the failure and recovery change are admissible.", "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}, "failure_class": {"type": "string"}, "route_identity": {"type": "string"}, "actionable_change": {"type": "string"}, "project_root": root}, "required": ["task_id", "failure_class", "route_identity"]}},
         "recover_task": {"name": "sdd_recover_task", "description": "Admit a durable recovery and promote its existing native task without creating a duplicate.", "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}, "failure_class": {"type": "string"}, "route_identity": {"type": "string"}, "actionable_change": {"type": "string"}, "project_root": root}, "required": ["task_id", "failure_class", "route_identity", "actionable_change"]}},
+        "complete_task": {"name": "sdd_complete_task", "description": "Release a worker/runtime reservation with actual runtime accounting after a native task reaches a terminal state.", "parameters": {"type": "object", "properties": {"operation_id": {"type": "string"}, "actual_seconds": {"type": "integer"}, "state": {"type": "string", "enum": ["completed", "failed", "released", "ambiguous"]}, "project_root": root}, "required": ["operation_id", "actual_seconds"]}},
     }
 
 
