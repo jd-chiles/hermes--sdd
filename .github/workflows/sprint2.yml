@@ -37,9 +37,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Hermes
         shell: bash
-        # Download-then-execute rather than `curl | bash`: the installer is
-        # fetched, written to disk, and run only after the transfer succeeds,
-        # and the Hermes revision is pinned for a reproducible contract run.
+        # Download-then-execute rather than piping a remote script straight
+        # into a shell: the installer is fetched, written to disk, and run
+        # only after the transfer succeeds, and the Hermes revision is pinned
+        # for a reproducible contract run.
         run: |
           set -euo pipefail
           curl -fsSL -o /tmp/hermes-install.sh https://hermes-agent.nousresearch.com/install.sh
