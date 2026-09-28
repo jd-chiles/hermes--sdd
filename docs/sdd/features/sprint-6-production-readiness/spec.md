@@ -32,7 +32,7 @@ The September 28 repository review ran all 53 existing tests successfully on Lin
 | Reinitialize the second request or start the third | `UNIQUE constraint failed: projects.root` | `Ledger.init_project` |
 | Empty submissions and unrelated checks | Separate engineer/reviewer submissions with no files and `python -c pass` evidence can yield acceptance | `Ledger.accept_project` |
 
-Source inspection also found that the CLI constructs a context without dispatch, unknown slash-command tokens fall through to execution, and host lifecycle receipt integration remains incomplete. The [baseline CI run](https://github.com/jd-chiles/hermes--spec-driven-development-plugin/actions/runs/36390287932) passed Linux repository checks, failed the archive-output exclusion test on macOS and Windows, and skipped all host jobs. These findings do not establish native-host behavior or certification.
+Source inspection also found that the CLI constructs a context without dispatch, unknown slash-command tokens fall through to execution, and host lifecycle receipt integration remains incomplete. The [baseline CI run](https://github.com/jd-chiles/hermes--sdd/actions/runs/36390287932) passed Linux repository checks, failed the archive-output exclusion test on macOS and Windows, and skipped all host jobs. These findings do not establish native-host behavior or certification.
 
 ## Scope
 

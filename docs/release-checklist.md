@@ -5,7 +5,7 @@ Verified release baseline: `2e5103a084cb1ac4611670a8bd4d381956767c03`
 Install and enable the exact pushed revision:
 
 ```text
-hermes plugins install jd-chiles/hermes--spec-driven-development-plugin --ref 2e5103a084cb1ac4611670a8bd4d381956767c03 --enable
+hermes plugins install jd-chiles/hermes--sdd --ref 2e5103a084cb1ac4611670a8bd4d381956767c03 --enable
 ```
 
 Source artifact evidence for this revision:

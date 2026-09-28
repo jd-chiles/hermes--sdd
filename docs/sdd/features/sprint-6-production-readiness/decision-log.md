@@ -28,7 +28,7 @@ Required checks belong to the spec, not the implementation's self-reported list.
 
 ## D-07 — Standardize the installed plugin identifier
 
-Use `jd-chiles/hermes--spec-driven-development-plugin` as the canonical repository and `hermes-sdd` as the installed identifier. Align public copy, tool schemas, help, and release metadata. Select the actual candidate version/ref during S6-12; this spec does not create a release.
+Use `jd-chiles/hermes--sdd` as the canonical repository and `hermes-sdd` as the installed identifier. Align public copy, tool schemas, help, and release metadata. Select the actual candidate version/ref during S6-12; this spec does not create a release.
 
 ## D-08 — Public diagnostics are read-only
 

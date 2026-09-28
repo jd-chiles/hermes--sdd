@@ -7,7 +7,7 @@ Hermes SDD turns a development request into a durable, verified local repository
 Use a released immutable revision when publishing:
 
 ```text
-hermes plugins install jd-chiles/hermes--spec-driven-development-plugin --ref <release-sha> --enable
+hermes plugins install jd-chiles/hermes--sdd --ref <release-sha> --enable
 ```
 
 The package is a native Hermes plugin (`plugin.yaml` + `register(ctx)`). It does not require a copied prompt, manual profile configuration, separate MCP server, or provider account. Execution currently uses assigned role profiles; their effective model configuration is not yet verified by the plugin. The current repository is an implementation slice and still requires host compatibility verification against the target Hermes release before public publication.
@@ -58,10 +58,10 @@ Release checks build and inspect the real artifact:
 ```bash
 python3 scripts/host_smoke.py
 python3 scripts/clean_install_smoke.py \
-  --repo jd-chiles/hermes--spec-driven-development-plugin \
+  --repo jd-chiles/hermes--sdd \
   --ref 400309b27a07d47a7a723ab8a205c343b4e920fe
 python3 scripts/profile_preservation_smoke.py \
-  --repo jd-chiles/hermes--spec-driven-development-plugin \
+  --repo jd-chiles/hermes--sdd \
   --ref 400309b27a07d47a7a723ab8a205c343b4e920fe
 ```
 
