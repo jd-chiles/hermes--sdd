@@ -152,7 +152,9 @@ class HermesBridge:
                     if result["exit_code"] != 0:
                         raise SDDError("native command failed or is still running; reconcile before retry")
                     result = result.get("output", "")
-                elif "result" in result:
+                elif "result" in result and not ({"id", "task_id"} & result.keys()):
+                    # Native task records also have a `result` field (usually
+                    # null before completion). It is task data, not an envelope.
                     result = result["result"]
                 else:
                     return result

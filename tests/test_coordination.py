@@ -245,3 +245,17 @@ class BridgeTests(unittest.TestCase):
         bridge.promote_task('board', 'native-1', 'changed route')
         self.assertIn('promote native-1', commands[0])
         self.assertIn('--json', commands[0])
+
+    def test_task_record_result_field_is_not_mistaken_for_an_envelope(self):
+        # Native task records carry a `result` field (null until completion).
+        # It is task data, not a result envelope, so decoding must return the
+        # record intact rather than unwrapping it to None.
+        record = {'id': 'native-1', 'task_id': 'native-1', 'title': 't', 'result': None}
+        self.assertEqual(HermesBridge.decode_response(record), record)
+        self.assertEqual(HermesBridge.decode_task_id(record), 'native-1')
+
+    def test_result_envelope_without_task_identifiers_still_unwraps(self):
+        # A genuine envelope has no id/task_id, so the guard must not
+        # regress the original unwrapping behaviour.
+        envelope = {'result': {'id': 'native-1'}}
+        self.assertEqual(HermesBridge.decode_task_id(envelope), 'native-1')
