@@ -69,6 +69,31 @@ class CoordinationTests(unittest.TestCase):
         plan = build_plan('new product', 'product')
         self.assertEqual(plan.tasks[3]['parent_keys'], ['T-002', 'T-003'])
 
+    def test_close_requires_acceptance_and_is_idempotent(self):
+        with self.assertRaises(SDDError):
+            self.service.close()
+        self.service.ledger.set_stage('accepted')
+        first = self.service.close()
+        second = self.service.close()
+        self.assertFalse(first['idempotent'])
+        self.assertTrue(second['idempotent'])
+        self.assertEqual(self.service.status()['project']['stage'], 'closed')
+
+    def test_closed_request_can_be_followed_by_new_request_without_deleting_history(self):
+        task = self.service.ledger.tasks()[0]
+        self.service.ledger.create_attempt(task['task_id'], 'hermes-cli', 'engineer', 1, [], [], 'historical result')
+        self.service.ledger.set_stage('accepted')
+        old_project = self.service.ledger.project()['project_id']
+        self.service.close()
+        self.service.initialize('Add a new feature', 'feature')
+        self.assertNotEqual(self.service.ledger.project()['project_id'], old_project)
+        with self.service.ledger._connect() as db:
+            projects = db.execute('SELECT project_id, stage FROM projects ORDER BY created_at').fetchall()
+            historical = db.execute('SELECT COUNT(*) FROM attempts WHERE task_id = ?', (task['task_id'],)).fetchone()[0]
+        self.assertEqual(len(projects), 2)
+        self.assertEqual(historical, 1)
+        self.assertEqual(self.service.status()['project']['stage'], 'planned')
+
     def test_dispatch_intent_is_idempotent_and_lease_can_be_renewed(self):
         task = self.service.ledger.tasks()[0]
         first = self.service.ledger.dispatch_intent(task['task_id'], task['stable_key'], 'dispatch-1', {'parents': []}, {'provider': 'p', 'model': 'm'})

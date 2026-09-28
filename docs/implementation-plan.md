@@ -14,7 +14,7 @@
 
 ## Current sprint
 
-[Sprint 3](sprints/sprint-3.md) prioritizes acceptance correctness, dispatch recovery, atomic admission, reproducible packaging, and [difficulty tiers with executable escalation](design/task-tiers-and-escalation.md). Tier routing and escalation are specified but not yet implemented. See the [project review](reviews/sprint-3-review.md) for known gaps in the delivered contracts.
+[Sprint 5](sprints/sprint-5.md) prioritizes request lifecycle and enforceable operational limits. Sprint 4 delivered local recovery budgets, native idempotency, and guarded native promotion; installed-host certification remains an external gate.
 
 ## Release and follow-up gates (see Sprint 2 for collected evidence)
 

@@ -159,6 +159,9 @@ class SDDService:
         plan = read_current_plan(self.ledger)
         return self.ledger.accept_project(plan["criteria"], self.root)
 
+    def close(self) -> dict[str, Any]:
+        return self.ledger.close_project()
+
     def doctor(self) -> dict[str, Any]:
         status = self.ledger.status()
         return {"plugin": "hermes-sdd-team", "root": str(self.root), "initialized": status["initialized"], "ledger": str(self.paths.database), "ledger_schema": SCHEMA_VERSION, "native_dispatch": self.bridge.available(), "limits": DEFAULT_LIMITS, "notes": ["Hermes owns worker processes, approvals, and Kanban persistence.", "The SDD ownership ledger is coordination metadata, not an OS security sandbox.", "Profiles and managed dependency adapters must be exercised against the target Hermes release before publication."]}
@@ -255,6 +258,8 @@ def _handle_tool(ctx: Any, name: str, params: dict[str, Any]) -> str:
             result = service.verify(params["attempt_id"], params["criterion_id"], params["command"], params.get("changed_files", []), int(params.get("timeout", 300)))
         elif name == "accept":
             result = service.accept()
+        elif name == "close":
+            result = service.close()
         elif name == "doctor":
             result = service.doctor()
         elif name == "pause":
@@ -283,6 +288,7 @@ def _schemas() -> dict[str, dict[str, Any]]:
         "submit": {"name": "sdd_submit_result", "description": "Submit an immutable worker result for SDD evaluation. Completion is not acceptance.", "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}, "attempt_id": {"type": "string"}, "spec_revision": {"type": "integer"}, "changed_files": {"type": "array", "items": {"type": "string"}}, "checks": {"type": "array", "items": {"type": "string"}}, "summary": {"type": "string"}, "role": {"type": "string"}, "project_root": root}, "required": ["task_id", "spec_revision", "summary"]}},
         "verify": {"name": "sdd_verify", "description": "Execute one explicit repository verification command and store immutable evidence with content fingerprints.", "parameters": {"type": "object", "properties": {"attempt_id": {"type": "string"}, "criterion_id": {"type": "string"}, "command": {"type": "string"}, "changed_files": {"type": "array", "items": {"type": "string"}}, "timeout": {"type": "integer"}, "project_root": root}, "required": ["attempt_id", "criterion_id", "command"]}},
         "accept": {"name": "sdd_accept", "description": "Evaluate project acceptance: required evidence, passing checks, current fingerprints, engineer result, and independent review.", "parameters": {"type": "object", "properties": {"project_root": root}}},
+        "close": {"name": "sdd_close", "description": "Close an accepted SDD request while preserving its ledger and evidence history for future requests.", "parameters": {"type": "object", "properties": {"project_root": root}}},
         "doctor": {"name": "sdd_doctor", "description": "Diagnose SDD installation, ledger, native dispatch, and compatibility notes.", "parameters": {"type": "object", "properties": {"project_root": root}}},
         "pause": {"name": "sdd_pause", "description": "Pause SDD dispatch while preserving durable progress.", "parameters": {"type": "object", "properties": {"project_root": root}}},
         "resume": {"name": "sdd_resume", "description": "Resume and reconcile a paused SDD project.", "parameters": {"type": "object", "properties": {"project_root": root}}},
@@ -298,7 +304,7 @@ def _slash(ctx: Any, raw_args: str) -> str:
         return _handle_tool(ctx, "status", {})
     command = tokens[0]
     rest = tokens[1] if len(tokens) == 2 else ""
-    if command in {"status", "doctor", "pause", "resume", "recover", "accept"}:
+    if command in {"status", "doctor", "pause", "resume", "recover", "accept", "close"}:
         return _handle_tool(ctx, command, {})
     if command in {"plan", "build", "fix"}:
         if not rest:
@@ -310,7 +316,7 @@ def _slash(ctx: Any, raw_args: str) -> str:
 
 def _cli_setup(parser: argparse.ArgumentParser) -> None:
     sub = parser.add_subparsers(dest="sdd_command")
-    for name in ("status", "doctor", "pause", "resume", "recover", "accept"):
+    for name in ("status", "doctor", "pause", "resume", "recover", "accept", "close"):
         command = sub.add_parser(name)
         command.add_argument("--project-root", default=None)
     for name in ("plan", "build", "fix"):
@@ -324,7 +330,7 @@ def _cli_handler(args: argparse.Namespace) -> None:
     root = Path(getattr(args, "project_root", None) or os.getcwd()).resolve()
     command = args.sdd_command or "status"
     context = type("CLIContext", (), {})()
-    if command in {"status", "doctor", "pause", "resume", "recover", "accept"}:
+    if command in {"status", "doctor", "pause", "resume", "recover", "accept", "close"}:
         result = _handle_tool(context, command, {"project_root": str(root)})
     else:
         result = _handle_tool(context, "initialize", {"project_root": str(root), "request": args.request, "mode": "bugfix" if command == "fix" else None, "execute": command in {"build", "fix"}})

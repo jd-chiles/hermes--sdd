@@ -261,13 +261,19 @@ class Ledger:
         with self._connect() as db:
             existing = db.execute("SELECT project_id FROM projects WHERE project_id = ?", (project_id,)).fetchone()
             if existing:
+                project = db.execute("SELECT * FROM projects WHERE project_id = ?", (project_id,)).fetchone()
                 current = db.execute("SELECT request, mode, content_json FROM specs WHERE project_id = ? ORDER BY revision DESC LIMIT 1", (project_id,)).fetchone()
-                if current and (current["request"] != request or current["mode"] != mode):
-                    raise SDDError("repository already has a different active SDD request; finish or recover it before starting another project")
-                if current and current["content_json"] != json_text(spec_content):
-                    raise SDDError("existing specification differs; explicit revision required before changing task policy")
-                already_initialized = True
-            else:
+                if project["stage"] != "closed":
+                    if current and (current["request"] != request or current["mode"] != mode):
+                        raise SDDError("repository already has a different active SDD request; close it after acceptance before starting another project")
+                    if current and current["content_json"] != json_text(spec_content):
+                        raise SDDError("existing specification differs; explicit revision required before changing task policy")
+                    already_initialized = True
+                else:
+                    archived_root = f"{root}#closed-{project_id}-{now}"
+                    db.execute("UPDATE projects SET root = ?, updated_at = ? WHERE project_id = ?", (archived_root, now, project_id))
+                    project_id = hashlib.sha256(f"{root}\0{request}\0{now}\0{uuid.uuid4()}".encode("utf-8")).hexdigest()[:16]
+            if not already_initialized:
                 db.execute(
                     "INSERT INTO projects(project_id, root, board_slug, stage, paused, limits_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
                     (project_id, root, board_slug, "planned", 0, json_text(selected_limits), now, now),
@@ -311,6 +317,21 @@ class Ledger:
                 db.execute("UPDATE projects SET stage = ?, updated_at = ? WHERE project_id = ?", (stage, utc_now(), project_id))
             else:
                 db.execute("UPDATE projects SET stage = ?, paused = ?, updated_at = ? WHERE project_id = ?", (stage, int(paused), utc_now(), project_id))
+
+    def close_project(self) -> dict[str, Any]:
+        project_id = self.project_id()
+        if not project_id:
+            raise SDDError("project is not initialized")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            project = db.execute("SELECT stage, paused FROM projects WHERE project_id = ?", (project_id,)).fetchone()
+            if project["stage"] == "closed":
+                return {"closed": True, "project_id": project_id, "idempotent": True}
+            if project["paused"] or project["stage"] != "accepted":
+                raise SDDError("only an unpaused accepted project can be closed")
+            db.execute("UPDATE projects SET stage = 'closed', updated_at = ? WHERE project_id = ?", (utc_now(), project_id))
+        self.append_event(project_id, "project_closed", {"stage": "accepted"}, f"{project_id}:closed")
+        return {"closed": True, "project_id": project_id, "idempotent": False}
 
     def tasks(self) -> list[dict[str, Any]]:
         project_id = self.project_id()
